@@ -6,6 +6,7 @@ mod http;
 mod jobs;
 mod ledger;
 mod limits;
+mod reclassify;
 mod revisions;
 mod telegram;
 mod uploads;
@@ -240,6 +241,7 @@ async fn serve(config: Config) -> Result<()> {
     }
 
     let telegram = client.clone();
+    let edits = Arc::new(telegram::poster::EditQueue::default());
     let poster = telegram::poster::Poster {
         client,
         chat_id,
@@ -247,8 +249,27 @@ async fn serve(config: Config) -> Result<()> {
         uploads: uploads.clone(),
         ledger: ledger.clone(),
         firmwares: firmwares.clone(),
+        edits: edits.clone(),
     };
     tokio::spawn(poster.run());
+
+    // After a zrax update, classify the store again (once the index is built).
+    let reclassify_status = reclassify::status("off");
+    let inflight = reclassify::Inflight::new(config.reclassify_inflight_path());
+    if config.reclassify.enabled {
+        reclassify_status.lock().unwrap().state = "waiting";
+        let reclassifier = reclassify::Reclassifier {
+            firmwares: firmwares.clone(),
+            policy: Arc::new(config.policy.clone()),
+            edits: edits.clone(),
+            zrax: analyze::zrax_label(),
+            threads: config.reclassify.threads,
+            memory_mib: config.reclassify.memory_mib,
+            inflight: inflight.clone(),
+            status: reclassify_status.clone(),
+        };
+        tokio::spawn(reclassifier.run());
+    }
 
     // Images posted before the firmware store existed come back from the group.
     let backfill_status = telegram::backfill::status("off");
@@ -280,7 +301,7 @@ async fn serve(config: Config) -> Result<()> {
         });
     }
 
-    let dashboard = Arc::new(dashboard::Dashboard::open(&config, catalog, backfill_status)?);
+    let dashboard = Arc::new(dashboard::Dashboard::open(&config, catalog, backfill_status, reclassify_status, edits)?);
     let app = http::router(http::AppState {
         config: config.clone(),
         pow,
@@ -305,6 +326,8 @@ async fn serve(config: Config) -> Result<()> {
         _ = async { tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} } } => {
             tracing::info!("shutting down");
             stop.notify_one();
+            // The files being classified didn't cause this exit.
+            inflight.close();
             // Upload state doesn't survive a restart anyway (clients start
             // those files again), so don't hold the restart for slow chunks.
             if tokio::time::timeout(SHUTDOWN_GRACE, &mut server).await.is_err() {

@@ -9,7 +9,7 @@ Firmware donation drop-box for [zr.ax](https://zr.ax), live at **https://fwdonor
 5. The server posts each one to Telegram group `-1003917356862` ("fwrepo"; was basic group `-5599544901` before Telegram upgraded it), using a TDLib bot, with a caption holding the zrax metadata and the donor's name.
 6. The server keeps a copy of every image it verified in `firmwares/` (see [Stored firmware](#stored-firmware)) and deletes the spooled upload.
 
-The page also shows the corpus live from `/api/stats`: images donated, images per ISA, and a "most wanted" list. That list holds the ISAs zrax's raw-code model can recognize that still have fewer than five images; once every one has five, it shows the ten with the fewest (more on a tie).
+The page also shows the corpus live from `/api/stats`: images donated, images per ISA, and a "most wanted" list, all as the current zrax classifies them (unclassified images don't count). That list holds the ISAs zrax's raw-code model can recognize that still have fewer than five images; once every one has five, it shows the ten with the fewest (more on a tie).
 
 The page keeps waiting through server restarts and outages. Each request retries with backoff up to 20 s and never gives up on a transient error. An upload the server lost is sent again from the start. A file that was posted just before a restart is recognized by its hash and marked donated.
 
@@ -27,6 +27,7 @@ The page keeps waiting through server restarts and outages. Each request retries
 | `src/telegram/` | libtdjson FFI, async client, sequential poster and caption builder |
 | `src/ledger.rs` | `runtime/posted.jsonl`, the dedup record of everything posted, plus the corpus statistics |
 | `src/firmwares.rs`, `src/telegram/backfill.rs` | the store of every verified donation, and the download of older posts back from the group |
+| `src/reclassify.rs`, `src/telegram/caption.rs` | classifying the store again after a zrax update, and the captions (and caption keys) of posts |
 | `web/` | the page (vanilla ES modules; zrax's `format.js` and fonts are copied in at build time); `web/corpus.js` is the live statistics panel |
 | `src/dashboard/` | the dashboard: the in-memory index of every image (`catalog.rs`), ISA families, firmware or other binaries (`kind.rs`), inspection (entropy, hex, strings), routes, downloads and exports |
 | `web/dash.{html,js}`, `web/dash-bulk.{html,js}`, `web/dash-common.js` | the dashboard pages (`/d/<key>`, `/d/<key>/bulk`) |
@@ -74,10 +75,12 @@ Every image the server verifies is kept in `firmware_dir` (default `/data/fwdono
 - **The record** holds:
   - `name`: the donor name the post credits;
   - `original_name`;
-  - `zrax`: the verdict summary, with zrax's version;
+  - `zrax`: the last verdict that accepted the file, with zrax's version;
+  - `unclassified`: set when the current zrax rejects the file (see [Reclassification](#reclassification));
+  - `checked`: the zrax that last classified the file, and an `error` if it came to no answer;
   - `received_at`;
   - `source`: `upload`, or `telegram` for recovered images;
-  - `telegram`: `chat_id`, `message_id`, `posted_at`, added once posted.
+  - `telegram`: `chat_id`, `message_id`, `posted_at`, added once posted; `shows`, a key of what the caption says, and `edit_failed` when Telegram won't let the post be edited.
 
   It has no IP address or other trace of the sender.
 - **Older posts:** images posted before the store existed are downloaded back from the Telegram group by the bot (`firmware_backfill`, on by default).
@@ -88,6 +91,29 @@ Every image the server verifies is kept in `firmware_dir` (default `/data/fwdono
 ```sh
 ssh root@int journalctl -u fwdonor -g backfill     # progress
 ssh root@int 'ls /data/fwdonor/firmwares | grep -vc json'   # images kept
+```
+
+### Reclassification
+
+After a zrax update, every stored image is classified again with the new zrax (`src/reclassify.rs`).
+
+- **Trigger:** each record names the zrax that last classified it. At every start, once the dashboard's index is built, the records classified by any other zrax are done again, newest first. Progress lives in the records, so a restart continues where the run stopped. A change to the policy lists alone doesn't start a run, but every run applies the current lists.
+- **Pace:** `[reclassify] threads` (3) files at once, on threads at the lowest CPU and I/O priority, and at most `memory_mib` (768) MiB of files in memory. A file zrax needs over 10 minutes for keeps its classification. The whole store (about 54k files, 214 GB) takes about 2 hours.
+- **Outcomes:**
+  - **Accepted:** the record, the dashboards and the statistics take the new classification.
+  - **Rejected** ("unclassified"): the file stays on disk and its record keeps the last classification that accepted it. It disappears from both dashboards, downloads and the main page's statistics, but still counts as already donated. A later zrax that accepts it brings it back.
+  - **No answer** (zrax crashed or timed out, the file couldn't be read): the record stays as it was until the next zrax update.
+  - **A crash:** `runtime/reclassify.inflight` lists the files being classified. Any still listed after an unclean exit are left as they were, so a file that takes the process down can't do it again at every start.
+- **Posts:** the poster edits the caption when what it says would change: format, variant, ISA, bits, byte order, slices or metadata. A different confidence or zrax version alone doesn't count. An unclassified file's post says "no longer classified by zrax …: <reason>", keeps the earlier classification on one line, and is tagged `#unclassified` instead of its ISA and format.
+  - Edits share the poster's pace (one Telegram action every 3 s). New donations go first; while both wait, every fifth turn is an edit.
+  - Before editing, the bot fetches the post and checks it is this file's post and that Telegram allows the edit. Posts from before the group became a supergroup (432 of them) can't be edited and are noted as such (`edit_failed`). Posts recovered by the backfill still show the zrax they were posted with until their classification next changes.
+  - A flood wait pauses edits only; posts continue.
+- **Watching it:** the private dashboard shows the run ("reclassify" in the totals: done, changed, unclassified, restored, posts to edit), and the journal has `reclassify:` lines every minute.
+- **Off switch:** `[reclassify] enabled = false`, for example before rolling back to an older zrax, which would otherwise classify everything again and edit the posts back.
+
+```sh
+ssh root@int journalctl -u fwdonor -g reclassify    # progress
+ssh root@int journalctl -u fwdonor -g 'edited the caption' | wc -l
 ```
 
 ## Bulk donations
@@ -159,6 +185,7 @@ A private, read-only view of everything donated: `/d/<dashboard key>` for the fi
   - **Totals:**
     - store coverage, with images not in the store yet and failed recoveries (both clickable);
     - backfill progress and rate;
+    - reclassification progress, posts still to edit, and how many images are hidden as unclassified;
     - the last 24 h and hour;
     - donors, ISAs and formats;
     - ISAs nobody has donated yet;
@@ -230,7 +257,7 @@ curl https://fwdonor.zr.ax/api/health
 
 **Deploys wait for a quiet moment.** `deploy.sh` builds while the old service keeps serving, with the new frontend staged in `dist.next/`. It then waits until `/api/health` reports no active uploads, an empty queue, and at least `IDLE_SECS` (default 10) without donation traffic. Only then does it swap `dist/` and restart. `MAX_WAIT=600 ./deploy.sh` restarts after 10 minutes regardless. The page copes with that, but a file in the middle of an upload has to be sent again. The restart itself takes about 0.1 s. The listener is bound before TDLib connects, so requests arriving in that window are queued rather than refused. For page-only changes, `FRONTEND_ONLY=1 ./deploy.sh` rebuilds and swaps `dist/` without restarting (the server reads it per request), so it needn't wait. Don't use it if the page needs anything new from the server.
 
-**Updating zrax:** put the new commit in `ZRAX_REV`, then run `./deploy.sh`. Pages that are already open keep the zrax they loaded. The server still accepts their uploads for 7 days (`src/revisions.rs`, history in `runtime/zrax-revs.json`) and re-verifies every file with its own zrax. Those pages show a notice suggesting a reload once their files are done. A server-side rejection of a file from such a page does not count towards a ban. After the 7 days, an old page is told to reload before donating more.
+**Updating zrax:** put the new commit in `ZRAX_REV`, then run `./deploy.sh`. After the restart the store is classified again and posts are edited where their caption changes (see [Reclassification](#reclassification)). Pages that are already open keep the zrax they loaded. The server still accepts their uploads for 7 days (`src/revisions.rs`, history in `runtime/zrax-revs.json`) and re-verifies every file with its own zrax. Those pages show a notice suggesting a reload once their files are done. A server-side rejection of a file from such a page does not count towards a ban. After the 7 days, an old page is told to reload before donating more.
 
 **Bot login** (run once, or whenever the token changes; the service must be stopped):
 
@@ -261,6 +288,8 @@ node tests/bulk.e2e.mjs target/release/fwdonor
 PLAYWRIGHT=…/playwright/index.mjs node tests/bulk.browser.e2e.mjs target/release/fwdonor [screenshot dir]
 # dashboard API: queries, facets, tree, details, downloads with Range, exports, bulk view, restart, privacy (DIR as above):
 node tests/dashboard.e2e.mjs target/release/fwdonor target/release/fwdonate DIR
+# the store classified again after a zrax update: outcomes, hidden files, post edits, a restart:
+node tests/reclassify.e2e.mjs target/release/fwdonor
 # dashboard pages in a browser (generates its own data):
 PLAYWRIGHT=…/playwright/index.mjs node tests/dashboard.browser.e2e.mjs target/release/fwdonor [screenshot dir]
 ```

@@ -78,6 +78,10 @@ bits = 16
 
 [telegram]
 dry_run = true
+
+# The seeded records are made up: zrax mustn't classify them again mid-test.
+[reclassify]
+enabled = false
 `);
 
 const log = openSync(path.join(work, 'server.log'), 'a');

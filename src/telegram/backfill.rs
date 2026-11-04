@@ -15,8 +15,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use super::client::{TdClient, TdError};
-use crate::analyze::{Analyzer, Verdict};
-use crate::firmwares::{Firmwares, Posted, Record};
+use crate::analyze::{zrax_label, Analyzer, Outcome, Verdict};
+use crate::firmwares::{Checked, Firmwares, Posted, Record, Unclassified};
 use crate::ledger::{Entry, Ledger};
 use crate::uploads::unix_now;
 
@@ -304,12 +304,17 @@ impl Backfill {
             Err(e) => return Err(Miss::Failed(format!("hashing panicked: {e}"))),
         }
         // What the current zrax makes of it, for the record (the ledger only
-        // has the format and ISA).
-        let zrax = match self.analyzer.analyze_file(path.to_owned()).await {
-            Verdict::Accepted(summary) => Some(summary),
-            Verdict::Rejected { reason } => {
-                tracing::info!(sha256 = %entry.sha256, %reason, "backfill: the current zrax no longer accepts this image; keeping it anyway");
-                None
+        // has the format and ISA). One it rejects is kept, but hidden.
+        let now = unix_now();
+        let (zrax, unclassified, error) = match self.analyzer.analyze_file_outcome(path.to_owned()).await {
+            Outcome::Verdict(Verdict::Accepted(summary)) => (Some(summary), None, None),
+            Outcome::Verdict(Verdict::Rejected { reason }) => {
+                tracing::info!(sha256 = %entry.sha256, %reason, "backfill: the current zrax no longer accepts this image; keeping it, hidden");
+                (None, Some(Unclassified { zrax: zrax_label(), since: now, reason }), None)
+            }
+            Outcome::Failed(reason) => {
+                tracing::warn!(sha256 = %entry.sha256, %reason, "backfill: zrax came to no answer on this image; keeping it");
+                (None, None, Some(reason))
             }
         };
         let record = Record {
@@ -318,9 +323,11 @@ impl Backfill {
             name: entry.username.clone(),
             original_name: entry.name.clone(),
             zrax,
+            unclassified,
+            checked: Some(Checked { zrax: zrax_label(), at: now, error }),
             received_at: entry.posted_at,
             source: "telegram".into(),
-            telegram: Some(Posted { chat_id: chat, message_id: entry.message_id, posted_at: entry.posted_at }),
+            telegram: Some(Posted::new(chat, entry.message_id, entry.posted_at)),
         };
         let (store, path) = (self.firmwares.clone(), path.to_owned());
         match tokio::task::spawn_blocking(move || store.keep(&path, &record)).await {

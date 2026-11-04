@@ -87,10 +87,17 @@ pub fn row(mut row: Value) -> Value {
     row
 }
 
-/// A store record as the public dashboard shows it (no `source`).
+/// A store record as the public dashboard shows it (no `source`, nothing
+/// about reclassification or post edits).
 pub fn record(mut record: Value) -> Value {
     if let Some(o) = record.as_object_mut() {
-        o.remove("source");
+        for key in ["source", "checked", "unclassified"] {
+            o.remove(key);
+        }
+        if let Some(t) = o.get_mut("telegram").and_then(Value::as_object_mut) {
+            t.remove("shows");
+            t.remove("edit_failed");
+        }
     }
     record
 }

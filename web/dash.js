@@ -917,6 +917,31 @@ function step(delta) {
 
 // ------------------------------------------------------------------ summary
 
+// Classifying the store again after a zrax update, and the posts to edit.
+function renderReclassify(s) {
+  const r = s.reclassify;
+  if (!r) return;
+  const e = r.edits ?? {};
+  const rev = String(r.zrax ?? '').split('@').pop();
+  const counts = [
+    [r.changed, 'changed'], [r.unclassified, 'unclassified'], [r.restored, 'restored'], [r.errors, 'without an answer'],
+  ].filter(([n]) => n).map(([n, what]) => `${num(n)} ${what}`).join(', ');
+  const posts = [
+    [e.pending, 'posts to edit'], [e.edited, 'edited'], [e.refused, "can't be edited"], [e.retry_later, 'retried at the next start'],
+  ].filter(([n]) => n).map(([n, what]) => `${num(n)} ${what}`).join(', ');
+  const [big, sub] = {
+    off: ['off', 'reclassification is off'],
+    waiting: ['waiting', 'reclassify after indexing'],
+    scanning: ['…', 'reclassify · reading the records'],
+    running: [`${r.todo ? Math.floor((100 * r.done) / r.todo) : 0}%`, `reclassify with zrax ${rev}: ${num(r.done)} of ${num(r.todo)}${counts ? ` · ${counts}` : ''}`],
+    finished: [r.todo ? 'done' : 'current', `${r.todo ? `reclassified with zrax ${rev}${counts ? ` · ${counts}` : ''}` : `every file classified by zrax ${rev}`}${r.finished_at && r.todo ? ` · ${ago(r.finished_at, s.now)}` : ''}`],
+    failed: ['failed', 'reclassify could not read the store'],
+  }[r.state] ?? [r.state, 'reclassify'];
+  const hidden = s.unclassified?.files ?? 0;
+  $('s-reclass').textContent = big;
+  $('s-reclass-sub').textContent = [sub, posts, hidden ? `${num(hidden)} hidden as unclassified` : ''].filter(Boolean).join(' · ');
+}
+
 function renderSummary(s) {
   summary = s;
   if (!openedAt) openedAt = s.now;
@@ -960,6 +985,7 @@ function renderSummary(s) {
   }[b.state] ?? [b.state, 'backfill'];
   $('s-backfill').textContent = bfText[0];
   $('s-backfill-sub').innerHTML = `${esc(bfText[1])}${s.unrecovered ? ` · <a href="#" data-status="unrecovered">${num(s.unrecovered)} failed</a>` : ''}`;
+  renderReclassify(s);
   $('s-queue').textContent = num(s.queue.active);
   $('s-queue-sub').textContent = `arriving · ${num(s.queue.queued)} queued to post${s.queue.paused ? ' · PAUSED' : ''}`;
   $('s-disk').textContent = size(s.disk.free);

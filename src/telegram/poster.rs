@@ -1,25 +1,39 @@
 //! Sequential poster: sends each verified job to the group as a document
 //! with a metadata caption, records it, then deletes the spooled file (the
 //! copy in the firmware store stays and is told where it was posted).
+//!
+//! It also edits the captions of posts whose file was classified anew
+//! (src/reclassify.rs). Posts and edits share one pace; new donations go
+//! first, but while both are waiting every fifth turn is an edit.
 
-use std::sync::Arc;
+use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::Serialize;
 use serde_json::{json, Value};
+use tokio::sync::Notify;
+use tokio::time::Instant;
 
+use super::caption;
 use super::client::{TdClient, TdError};
 use crate::analyze::Summary;
-use crate::firmwares::{Firmwares, Posted};
+use crate::firmwares::{Edit, Firmwares, Posted};
 use crate::jobs::{Job, PostQueue};
 use crate::ledger::{Entry, Ledger};
 use crate::uploads::{unix_now, UploadState, Uploads};
 
-const CAPTION_MAX: usize = 1024;
 const MAX_ATTEMPTS: u32 = 5;
 /// Bots get roughly 20 messages a minute per group; stay well below.
 const MIN_INTERVAL: Duration = Duration::from_secs(3);
 /// How long to wait before retrying when the bot cannot write to the chat.
 const CHAT_RETRY: Duration = Duration::from_secs(60);
+/// While posts and edits are both waiting, an edit after this many posts.
+const POSTS_PER_EDIT: u32 = 4;
+/// Tries per edit in one run (transient errors); then the next start.
+const EDIT_ATTEMPTS: u32 = 3;
+const EDIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Errors about the chat rather than the file: retrying another file would
 /// fail the same way, so the job must be kept, never discarded.
@@ -40,80 +54,6 @@ fn chat_level(err: &TdError) -> bool {
         .any(|p| m.contains(p))
 }
 
-pub struct Caption {
-    pub text: String,
-    /// (utf16 offset, utf16 length) of code spans.
-    pub code: Vec<(usize, usize)>,
-}
-
-impl Caption {
-    pub fn to_formatted_text(&self) -> Value {
-        let entities: Vec<Value> = self
-            .code
-            .iter()
-            .map(|(offset, length)| {
-                json!({"@type": "textEntity", "offset": offset, "length": length, "type": {"@type": "textEntityTypeCode"}})
-            })
-            .collect();
-        json!({"@type": "formattedText", "text": self.text, "entities": entities})
-    }
-}
-
-struct Builder {
-    text: String,
-    code: Vec<(usize, usize)>,
-}
-
-impl Builder {
-    fn utf16_len(&self) -> usize {
-        self.text.encode_utf16().count()
-    }
-    fn push(&mut self, s: &str) {
-        self.text.push_str(s);
-    }
-    fn code(&mut self, s: &str) {
-        let offset = self.utf16_len();
-        let length = s.encode_utf16().count();
-        self.text.push_str(s);
-        if length > 0 {
-            self.code.push((offset, length));
-        }
-    }
-}
-
-pub fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
-fn hashtag(raw: &str) -> Option<String> {
-    let tag: String = raw
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect::<String>()
-        .trim_matches('_')
-        .to_string();
-    (!tag.is_empty() && !tag.chars().all(|c| c.is_ascii_digit())).then(|| format!("#{tag}"))
-}
-
-/// zrax sometimes reports a Rust debug rendering or the format name itself as
-/// the variant; neither adds anything to the post.
-pub fn clean_variant<'a>(variant: &'a str, format_name: &str) -> Option<&'a str> {
-    let v = variant.trim();
-    (!v.is_empty() && !v.contains('{') && !v.eq_ignore_ascii_case(format_name)).then_some(v)
-}
-
 /// Primary ISA first, then the other ISAs found in slices, once each.
 fn distinct_isas(s: &Summary) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -125,92 +65,92 @@ fn distinct_isas(s: &Summary) -> Vec<String> {
     out
 }
 
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
+/// Posts whose caption should be edited (by sha256), once each, and what
+/// came of the edits so far.
+#[derive(Default)]
+pub struct EditQueue {
+    queue: Mutex<(VecDeque<String>, HashSet<String>)>,
+    notify: Notify,
+    edited: AtomicUsize,
+    already: AtomicUsize,
+    refused: AtomicUsize,
+    retry_later: AtomicUsize,
 }
 
-/// Build the post caption. Optional lines (slices, metadata) are shortened
-/// first so the essentials always fit within 1024 code points.
-pub fn build_caption(job: &Job) -> Caption {
-    let s: &Summary = &job.summary;
-    let name = truncate_chars(&job.name, 160);
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct EditCounts {
+    pub pending: usize,
+    /// Captions changed.
+    pub edited: usize,
+    /// The post already showed the caption.
+    pub already: usize,
+    /// Telegram won't let them be edited (or the post is gone).
+    pub refused: usize,
+    /// Kept failing; tried again at the next start.
+    pub retry_later: usize,
+}
 
-    let classification = match (&s.isa_name, s.basis.as_str()) {
-        (Some(isa), _) => {
-            let mut line = isa.clone();
-            if s.bitwidth > 0 {
-                line.push_str(&format!(" · {}-bit", s.bitwidth));
-            }
-            if !s.endianness.is_empty() {
-                line.push_str(&format!(" {}", s.endianness));
-            }
-            line.push_str(&format!(" · {:.1}% ({})", s.confidence * 100.0, s.source.replace('_', " ")));
-            line
+impl EditQueue {
+    pub fn push(&self, sha256: String) {
+        let mut q = self.queue.lock().unwrap();
+        if q.1.insert(sha256.clone()) {
+            q.0.push_back(sha256);
+            drop(q);
+            self.notify.notify_one();
         }
-        _ => "firmware container, no ISA resolved".to_string(),
-    };
-    let mut format_line = s.format_name.clone();
-    if let Some(variant) = s.format_variant.as_deref().and_then(|v| clean_variant(v, &s.format_name)) {
-        format_line.push_str(&format!(" ({variant})"));
-    }
-    if let Some(variant) = s.variant.as_deref().filter(|v| !v.is_empty()) {
-        format_line.push_str(&format!(" · {variant}"));
     }
 
-    let tags: Vec<String> = [s.isa_tag.as_deref(), Some(s.format.as_str())]
-        .into_iter()
-        .flatten()
-        .filter_map(hashtag)
-        .chain(std::iter::once("#fwdonor".to_string()))
-        .collect();
-    let footer = format!("zrax {}  {}", s.zrax, tags.join(" "));
-
-    let slices: Vec<String> = s
-        .slices
-        .iter()
-        .map(|sl| {
-            let isa = sl.isa_name.as_deref().unwrap_or("?");
-            match sl.label.as_deref().filter(|l| !l.is_empty()) {
-                Some(label) => format!("{label}: {isa}"),
-                None => isa.to_string(),
-            }
-        })
-        .collect();
-    let meta: Vec<String> = s.metadata.iter().map(|m| format!("{} {}", m.label, m.value)).collect();
-
-    let build = |budget: usize| -> Caption {
-        let mut b = Builder { text: String::new(), code: Vec::new() };
-        b.push("📦 ");
-        b.code(&name);
-        b.push("\ndonated by ");
-        b.code(&job.username);
-        b.push(&format!("\n{format_line}\n{classification}\n{} · sha256 ", human_size(job.size)));
-        b.code(&job.sha256);
-        let optional = [("slices", &slices), ("meta", &meta)];
-        for (label, items) in optional {
-            if items.is_empty() || budget == 0 {
-                continue;
-            }
-            let line = truncate_chars(&format!("{label}: {}", items.join(", ")), budget);
-            b.push(&format!("\n{line}"));
+    fn push_front(&self, sha256: String) {
+        let mut q = self.queue.lock().unwrap();
+        if q.1.insert(sha256.clone()) {
+            q.0.push_front(sha256);
         }
-        b.push(&format!("\n{footer}"));
-        Caption { text: b.text, code: b.code }
-    };
-
-    let mut budget = 400;
-    loop {
-        let caption = build(budget);
-        if caption.text.chars().count() <= CAPTION_MAX || budget == 0 {
-            return caption;
-        }
-        budget = budget.saturating_sub(50);
     }
+
+    pub(crate) fn pop(&self) -> Option<String> {
+        let mut q = self.queue.lock().unwrap();
+        let sha = q.0.pop_front()?;
+        q.1.remove(&sha);
+        Some(sha)
+    }
+
+    async fn next(&self) -> String {
+        loop {
+            if let Some(sha) = self.pop() {
+                return sha;
+            }
+            self.notify.notified().await;
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.queue.lock().unwrap().0.len()
+    }
+
+    pub fn counts(&self) -> EditCounts {
+        EditCounts {
+            pending: self.len(),
+            edited: self.edited.load(Ordering::Relaxed),
+            already: self.already.load(Ordering::Relaxed),
+            refused: self.refused.load(Ordering::Relaxed),
+            retry_later: self.retry_later.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// What came of one edit.
+enum Edited {
+    /// Done, or nothing to do. `used_telegram`: it counts towards the pace.
+    Done { used_telegram: bool },
+    /// Flood wait or the chat refusing the bot: no edits for this long.
+    Pause(Duration),
+    /// A transient error: try again later in this run.
+    Again,
+}
+
+enum Work {
+    Post(Job),
+    Edit(String),
 }
 
 pub struct Poster {
@@ -220,53 +160,106 @@ pub struct Poster {
     pub uploads: Arc<Uploads>,
     pub ledger: Arc<Ledger>,
     pub firmwares: Arc<Firmwares>,
+    pub edits: Arc<EditQueue>,
 }
 
 impl Poster {
     pub async fn run(mut self) {
+        let mut posts_in_a_row = 0;
+        let mut edits_from = Instant::now();
+        let mut attempts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         loop {
-            let job = self.queue.next().await;
-            self.uploads.set_state(&job.id, UploadState::Posting);
-            let started = tokio::time::Instant::now();
-            match self.post(&job).await {
-                Ok(message_id) => {
-                    let entry = Entry {
-                        sha256: job.sha256.clone(),
-                        name: job.name.clone(),
-                        size: job.size,
-                        username: job.username.clone(),
-                        format: job.summary.format.clone(),
-                        isa: job.summary.isa.clone(),
-                        isas: distinct_isas(&job.summary),
-                        message_id,
-                        posted_at: unix_now(),
-                    };
-                    if let Err(e) = self.ledger.record(&entry) {
-                        tracing::error!(id = %job.id, "ledger write failed: {e:#}");
-                    }
-                    self.firmwares.catalog().posted(&entry, self.chat_id);
-                    let posted = Posted { chat_id: self.chat_id, message_id, posted_at: entry.posted_at };
-                    let (store, sha) = (self.firmwares.clone(), job.sha256.clone());
-                    match tokio::task::spawn_blocking(move || store.mark_posted(&sha, posted)).await {
-                        Ok(Ok(true)) => {}
-                        Ok(Ok(false)) => tracing::warn!(id = %job.id, "posted, but no copy of it is kept"),
-                        Ok(Err(e)) => tracing::error!(id = %job.id, "noting the post in the firmware record failed: {e}"),
-                        Err(e) => tracing::error!(id = %job.id, "noting the post panicked: {e}"),
-                    }
-                    tracing::info!(id = %job.id, name = %job.name, message_id, "posted");
-                    self.uploads.finish(&job.id, UploadState::Posted);
+            let edits_ready = Instant::now() >= edits_from;
+            let turn = (posts_in_a_row >= POSTS_PER_EDIT && edits_ready).then(|| self.edits.pop()).flatten();
+            let work = match turn {
+                Some(sha) => Work::Edit(sha),
+                None => tokio::select! {
+                    biased;
+                    job = self.queue.next() => Work::Post(job),
+                    sha = self.edits.next(), if edits_ready => Work::Edit(sha),
+                    _ = tokio::time::sleep_until(edits_from), if !edits_ready => continue,
+                },
+            };
+            let started = Instant::now();
+            match work {
+                Work::Post(job) => {
+                    posts_in_a_row += 1;
+                    self.post_job(job).await;
+                    tokio::time::sleep_until(started + MIN_INTERVAL).await;
                 }
-                Err(reason) => {
-                    tracing::error!(id = %job.id, name = %job.name, %reason, "posting failed, discarding");
-                    self.uploads.finish(&job.id, UploadState::Failed { reason });
+                Work::Edit(sha) => {
+                    posts_in_a_row = 0;
+                    match self.edit(&sha).await {
+                        Edited::Done { used_telegram } => {
+                            attempts.remove(&sha);
+                            if used_telegram {
+                                tokio::time::sleep_until(started + MIN_INTERVAL).await;
+                            }
+                        }
+                        Edited::Pause(wait) => {
+                            edits_from = Instant::now() + wait;
+                            self.edits.push_front(sha);
+                        }
+                        Edited::Again => {
+                            let n = attempts.entry(sha.clone()).or_default();
+                            *n += 1;
+                            if *n < EDIT_ATTEMPTS {
+                                self.edits.push(sha);
+                            } else {
+                                attempts.remove(&sha);
+                                self.edits.retry_later.fetch_add(1, Ordering::Relaxed);
+                                tracing::warn!(sha256 = %sha, "editing the post keeps failing; trying again at the next start");
+                            }
+                            tokio::time::sleep_until(started + MIN_INTERVAL * 2).await;
+                        }
+                    }
                 }
             }
-            tokio::time::sleep_until(started + MIN_INTERVAL).await;
+        }
+    }
+
+    async fn post_job(&mut self, job: Job) {
+        self.uploads.set_state(&job.id, UploadState::Posting);
+        match self.post(&job).await {
+            Ok(message_id) => {
+                let entry = Entry {
+                    sha256: job.sha256.clone(),
+                    name: job.name.clone(),
+                    size: job.size,
+                    username: job.username.clone(),
+                    format: job.summary.format.clone(),
+                    isa: job.summary.isa.clone(),
+                    isas: distinct_isas(&job.summary),
+                    message_id,
+                    posted_at: unix_now(),
+                };
+                if let Err(e) = self.ledger.record(&entry) {
+                    tracing::error!(id = %job.id, "ledger write failed: {e:#}");
+                }
+                self.firmwares.catalog().posted(&entry, self.chat_id);
+                let mut posted = Posted::new(self.chat_id, message_id, entry.posted_at);
+                posted.shows = Some(caption::job_key(&job));
+                let (store, sha) = (self.firmwares.clone(), job.sha256.clone());
+                match tokio::task::spawn_blocking(move || store.mark_posted(&sha, posted)).await {
+                    Ok(Ok(Some(false))) => {}
+                    // Classified anew while it waited (a zrax update).
+                    Ok(Ok(Some(true))) => self.edits.push(job.sha256.clone()),
+                    Ok(Ok(None)) => tracing::warn!(id = %job.id, "posted, but no copy of it is kept"),
+                    Ok(Err(e)) => tracing::error!(id = %job.id, "noting the post in the firmware record failed: {e}"),
+                    Err(e) => tracing::error!(id = %job.id, "noting the post panicked: {e}"),
+                }
+                tracing::info!(id = %job.id, name = %job.name, message_id, "posted");
+                self.uploads.finish(&job.id, UploadState::Posted);
+            }
+            Err(reason) => {
+                tracing::error!(id = %job.id, name = %job.name, %reason, "posting failed, discarding");
+                self.uploads.finish(&job.id, UploadState::Failed { reason });
+            }
         }
     }
 
     async fn post(&mut self, job: &Job) -> Result<i64, String> {
-        let caption = build_caption(job);
+        let caption = caption::for_job(job);
         let Some(client) = &self.client else {
             tracing::info!(id = %job.id, "dry run, would post {}:\n{}", job.file.display(), caption.text);
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -343,12 +336,144 @@ impl Poster {
             }
         }
     }
+
+    async fn note(&self, sha: &str, message_id: i64, edit: Edit) {
+        let counter = match &edit {
+            Edit::Shows(_) => None,
+            Edit::Refused(reason) => {
+                tracing::info!(sha256 = %sha, message_id, %reason, "the post can't be edited");
+                Some(&self.edits.refused)
+            }
+        };
+        if let Some(c) = counter {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+        let (store, sha) = (self.firmwares.clone(), sha.to_string());
+        match tokio::task::spawn_blocking(move || store.note_edit(&sha, message_id, edit)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!("noting the edit in the firmware record failed: {e}"),
+            Err(e) => tracing::error!("noting the edit panicked: {e}"),
+        }
+    }
+
+    /// Bring the caption of `sha256`'s post up to date with its record.
+    async fn edit(&self, sha: &str) -> Edited {
+        let record = {
+            let (store, owned) = (self.firmwares.clone(), sha.to_string());
+            match tokio::task::spawn_blocking(move || store.record(&owned)).await {
+                Ok(Ok(Some(r))) => r,
+                Ok(Ok(None)) => return Edited::Done { used_telegram: false },
+                Ok(Err(e)) => {
+                    tracing::error!(sha256 = %sha, "reading the record failed: {e}");
+                    return Edited::Done { used_telegram: false };
+                }
+                Err(_) => return Edited::Done { used_telegram: false },
+            }
+        };
+        let (Some(post), true) = (record.telegram.clone(), record.post_stale()) else {
+            return Edited::Done { used_telegram: false };
+        };
+        let (Some(caption), Some(key)) = (caption::for_record(&record), caption::record_key(&record)) else {
+            return Edited::Done { used_telegram: false };
+        };
+        if !post.editable() {
+            self.note(sha, post.message_id, Edit::Refused("posted before the group became a supergroup, so it can't be edited".into()))
+                .await;
+            return Edited::Done { used_telegram: false };
+        }
+        let Some(client) = &self.client else {
+            tracing::info!(sha256 = %sha, "dry run, would edit {}/{}:\n{}", post.chat_id, post.message_id, caption.text);
+            self.edits.edited.fetch_add(1, Ordering::Relaxed);
+            self.note(sha, post.message_id, Edit::Shows(key)).await;
+            return Edited::Done { used_telegram: false };
+        };
+        let (chat, id) = (post.chat_id, post.message_id);
+        let message = match client.request_timeout(json!({"@type": "getMessage", "chat_id": chat, "message_id": id}), EDIT_TIMEOUT).await {
+            Ok(m) => m,
+            Err(e) => return self.edit_failed(sha, id, "fetching the post", &e).await,
+        };
+        let shown = message["content"]["caption"]["text"].as_str().unwrap_or("");
+        if message["content"]["@type"] != "messageDocument" || !shown.contains(sha) {
+            self.note(sha, id, Edit::Refused("the message is not this file's post".into())).await;
+            return Edited::Done { used_telegram: true };
+        }
+        if shown == caption.text {
+            self.edits.already.fetch_add(1, Ordering::Relaxed);
+            self.note(sha, id, Edit::Shows(key)).await;
+            return Edited::Done { used_telegram: true };
+        }
+        match client.request_timeout(json!({"@type": "getMessageProperties", "chat_id": chat, "message_id": id}), EDIT_TIMEOUT).await {
+            Ok(p) if p["can_be_edited"] == false => {
+                self.note(sha, id, Edit::Refused("Telegram doesn't allow editing it".into())).await;
+                return Edited::Done { used_telegram: true };
+            }
+            Ok(_) => {}
+            Err(e) => return self.edit_failed(sha, id, "checking the post", &e).await,
+        }
+        let request = json!({
+            "@type": "editMessageCaption",
+            "chat_id": chat,
+            "message_id": id,
+            "caption": caption.to_formatted_text(),
+        });
+        match client.request_timeout(request, EDIT_TIMEOUT).await {
+            Ok(_) => {}
+            Err(e) if e.message.contains("MESSAGE_NOT_MODIFIED") => {}
+            Err(e) => return self.edit_failed(sha, id, "editing the post", &e).await,
+        }
+        tracing::info!(sha256 = %sha, message_id = id, "edited the caption");
+        self.edits.edited.fetch_add(1, Ordering::Relaxed);
+        self.note(sha, id, Edit::Shows(key)).await;
+        Edited::Done { used_telegram: true }
+    }
+
+    async fn edit_failed(&self, sha: &str, message_id: i64, what: &str, e: &TdError) -> Edited {
+        match edit_error(e) {
+            EditError::Chat => {
+                tracing::warn!(sha256 = %sha, "{what}: {e}; no edits for {CHAT_RETRY:?}");
+                Edited::Pause(CHAT_RETRY)
+            }
+            EditError::Flood(wait) => {
+                tracing::info!(sha256 = %sha, "flood wait {wait}s while {what}; posts continue");
+                Edited::Pause(Duration::from_secs(wait + 1))
+            }
+            EditError::Final => {
+                self.note(sha, message_id, Edit::Refused(format!("{what}: {}", e.message))).await;
+                Edited::Done { used_telegram: true }
+            }
+            EditError::Transient => {
+                tracing::warn!(sha256 = %sha, "{what}: {e}");
+                Edited::Again
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum EditError {
+    /// The bot can't act in the chat now (no rights, kicked): pause.
+    Chat,
+    Flood(u64),
+    /// The post is gone or can't be edited: don't try again.
+    Final,
+    Transient,
+}
+
+fn edit_error(e: &TdError) -> EditError {
+    if chat_level(e) {
+        EditError::Chat
+    } else if let Some(wait) = e.retry_after() {
+        EditError::Flood(wait)
+    } else if matches!(e.code, 400 | 404) {
+        EditError::Final
+    } else {
+        EditError::Transient
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyze::{MetaSummary, SliceSummary};
 
     #[test]
     fn chat_level_errors_are_recognized() {
@@ -360,60 +485,31 @@ mod tests {
         assert!(!chat_level(&e(-2, "upload confirmation timed out")));
     }
 
-    fn job(name: &str, slices: usize) -> Job {
-        Job {
-            id: "00".repeat(12),
-            name: name.into(),
-            size: 5 * 1024 * 1024 + 123,
-            sha256: "ab".repeat(32),
-            username: "donor_1".into(),
-            summary: Summary {
-                format: "uimage".into(),
-                format_name: "U-Boot uImage".into(),
-                format_variant: Some("kernel".into()),
-                isa: Some("arm".into()),
-                isa_name: Some("ARM (32-bit)".into()),
-                isa_tag: Some("arm".into()),
-                bitwidth: 32,
-                endianness: "little".into(),
-                confidence: 0.973,
-                source: "file_format".into(),
-                variant: None,
-                slices: (0..slices)
-                    .map(|i| SliceSummary {
-                        label: Some(format!("member-{i}-with-a-long-name")),
-                        isa: Some("arm".into()),
-                        isa_name: Some("ARM (32-bit)".into()),
-                        bitwidth: 32,
-                        offset: 0,
-                        size: 0,
-                    })
-                    .collect(),
-                metadata: vec![MetaSummary { label: "Entry point".into(), value: "0x8000".into() }],
-                basis: "isa".into(),
-                zrax: "0.1.0@d3f4a7a".into(),
-            },
-            file: "/tmp/x".into(),
-            created_at: 0,
-        }
+    #[test]
+    fn edit_errors_are_sorted() {
+        let e = |code, message: &str| edit_error(&TdError { code, message: message.into() });
+        assert_eq!(e(404, "Message not found"), EditError::Final);
+        assert_eq!(e(400, "Message can't be edited"), EditError::Final);
+        assert_eq!(e(403, "Forbidden: bot is not a member of the supergroup chat"), EditError::Chat);
+        assert_eq!(e(400, "Not enough rights to edit messages in the chat"), EditError::Chat);
+        assert_eq!(e(429, "Too Many Requests: retry after 17"), EditError::Flood(17));
+        assert_eq!(e(-2, "TDLib request timed out"), EditError::Transient);
+        assert_eq!(e(500, "Internal Server Error"), EditError::Transient);
     }
 
     #[test]
-    fn caption_has_code_entities_at_utf16_offsets() {
-        let c = build_caption(&job("rüter 🛜.bin", 2));
-        let utf16: Vec<u16> = c.text.encode_utf16().collect();
-        let spans: Vec<String> =
-            c.code.iter().map(|(o, l)| String::from_utf16(&utf16[*o..*o + *l]).unwrap()).collect();
-        assert_eq!(spans, vec!["rüter 🛜.bin".to_string(), "donor_1".into(), "ab".repeat(32)]);
-        assert!(c.text.contains("#arm #uimage #fwdonor"), "{}", c.text);
-        assert!(c.text.contains("5.0 MiB"));
-    }
-
-    #[test]
-    fn caption_fits_limit() {
-        let c = build_caption(&job(&"😀".repeat(200), 400));
-        assert!(c.text.chars().count() <= CAPTION_MAX, "{}", c.text.chars().count());
-        assert!(c.text.contains("sha256"));
-        assert!(c.text.ends_with("#fwdonor"));
+    fn the_edit_queue_holds_each_post_once() {
+        let q = EditQueue::default();
+        q.push("a".into());
+        q.push("b".into());
+        q.push("a".into());
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.pop().as_deref(), Some("a"));
+        q.push_front("c".into());
+        assert_eq!(q.pop().as_deref(), Some("c"));
+        assert_eq!(q.pop().as_deref(), Some("b"));
+        assert_eq!(q.pop(), None);
+        q.push("a".into());
+        assert_eq!(q.len(), 1, "popped posts can be queued again");
     }
 }

@@ -231,9 +231,17 @@ impl Analyzer {
         let _ = tokio::task::spawn_blocking(move || evaluate(&[0x90; 4096], &policy)).await;
     }
 
+    /// A donation's verdict: zrax not coming to an answer is a rejection.
     pub async fn analyze_file(&self, path: PathBuf) -> Verdict {
+        match self.analyze_file_outcome(path).await {
+            Outcome::Verdict(v) => v,
+            Outcome::Failed(reason) => Verdict::reject(reason),
+        }
+    }
+
+    pub async fn analyze_file_outcome(&self, path: PathBuf) -> Outcome {
         let Ok(permit) = self.permits.clone().acquire_owned().await else {
-            return Verdict::reject("analyzer shut down");
+            return Outcome::Failed("analyzer shut down".into());
         };
         let policy = self.policy.clone();
         // The permit lives inside the blocking closure: a timed-out analysis
@@ -241,18 +249,33 @@ impl Analyzer {
         // pile up unbounded CPU work.
         let task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let data = match std::fs::read(&path) {
-                Ok(d) => d,
-                Err(e) => return Verdict::reject(format!("read failed: {e}")),
-            };
-            std::panic::catch_unwind(AssertUnwindSafe(|| evaluate(&data, &policy)))
-                .unwrap_or_else(|_| Verdict::reject("analysis crashed"))
+            evaluate_file(&path, &policy)
         });
         match tokio::time::timeout(self.timeout, task).await {
-            Ok(Ok(verdict)) => verdict,
-            Ok(Err(e)) => Verdict::reject(format!("analysis failed: {e}")),
-            Err(_) => Verdict::reject("analysis timed out"),
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(e)) => Outcome::Failed(format!("analysis failed: {e}")),
+            Err(_) => Outcome::Failed("analysis timed out".into()),
         }
+    }
+}
+
+/// zrax's verdict on a file, or why there is none.
+#[derive(Debug, Clone)]
+pub enum Outcome {
+    Verdict(Verdict),
+    /// The file couldn't be read, or zrax crashed or ran out of time.
+    Failed(String),
+}
+
+/// Blocking. Read and classify a file, catching a zrax panic.
+pub fn evaluate_file(path: &std::path::Path, policy: &Policy) -> Outcome {
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) => return Outcome::Failed(format!("read failed: {e}")),
+    };
+    match std::panic::catch_unwind(AssertUnwindSafe(|| evaluate(&data, policy))) {
+        Ok(v) => Outcome::Verdict(v),
+        Err(_) => Outcome::Failed("analysis crashed".into()),
     }
 }
 

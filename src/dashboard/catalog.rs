@@ -19,7 +19,7 @@ use super::families;
 use super::kind::{self, Kind, KINDS};
 use crate::analyze::isa_display_name;
 use crate::firmwares::Record;
-use crate::ledger::Entry;
+use crate::ledger::{Entry, Snapshot, Tally as LedgerTally};
 
 /// The key of "no value" in every dimension (never a valid name, ISA,
 /// format or extension).
@@ -143,6 +143,8 @@ const TIME: u32 = 1 << 18;
 const CONF: u32 = 1 << 19;
 const MULTI: u32 = 1 << 20;
 const SHAS: u32 = 1 << 21;
+/// Unclassified by the current zrax: no filter or facet lets it through.
+const HIDDEN: u32 = 1 << 22;
 
 // ------------------------------------------------------------------ rows
 
@@ -216,6 +218,8 @@ struct Row {
     /// Built from a store record (not only from the ledger).
     has_record: bool,
     unrecovered: Option<Box<str>>,
+    /// The current zrax rejects it: kept in the store, shown nowhere.
+    hidden: bool,
 }
 
 impl Row {
@@ -425,6 +429,7 @@ impl Index {
             stored: true,
             has_record: true,
             unrecovered: None,
+            hidden: r.hidden(),
         };
         let ext = ext_of(&r.original_name);
         row.ext = self.ext.id(&ext);
@@ -506,6 +511,7 @@ impl Index {
             stored: false,
             has_record: false,
             unrecovered: None,
+            hidden: false,
         };
         row.ext = self.ext.id(&ext_of(&e.name));
         row.search = self.search_text(&row, &[]);
@@ -1136,8 +1142,13 @@ impl Catalog {
         let mut isas = HashSet::new();
         let mut formats = HashSet::new();
         let mut kinds = [0u64; KINDS.len()];
+        let mut hidden = Tally::default();
         let current = ix.zrax.find(current_zrax).unwrap_or(u32::MAX);
         for r in &ix.rows {
+            if r.hidden {
+                hidden.add(r.size);
+                continue;
+            }
             total.add(r.size);
             kinds[r.kind as usize] += 1;
             match r.status() {
@@ -1195,6 +1206,7 @@ impl Catalog {
             "first_at": (first != u64::MAX).then_some(first),
             "last_at": (last > 0).then_some(last),
             "older_zrax": older,
+            "unclassified": { "files": hidden.files, "bytes": hidden.bytes },
             "zrax": current_zrax,
             "wanted": wanted,
         })
@@ -1204,11 +1216,11 @@ impl Catalog {
     pub fn detail(&self, sha256: &str) -> Option<(Value, Vec<Value>)> {
         let sha = parse_sha(sha256)?;
         let ix = self.index.read().unwrap();
-        let row = ix.get(&sha)?;
+        let row = ix.get(&sha).filter(|r| !r.hidden)?;
         let same: Vec<Value> = ix
             .rows
             .iter()
-            .filter(|r| r.name == row.name && r.sha != row.sha)
+            .filter(|r| r.name == row.name && r.sha != row.sha && !r.hidden)
             .take(50)
             .map(|r| ix.row_json(r))
             .collect();
@@ -1219,7 +1231,59 @@ impl Catalog {
     pub fn stored_name(&self, sha256: &str) -> Option<String> {
         let sha = parse_sha(sha256)?;
         let ix = self.index.read().unwrap();
-        ix.get(&sha).filter(|r| r.stored).map(|r| r.name.to_string())
+        ix.get(&sha).filter(|r| r.stored && !r.hidden).map(|r| r.name.to_string())
+    }
+
+    /// The corpus statistics of the main page, as the ledger would have
+    /// them, but with every file as classified now: posted images that the
+    /// current zrax accepts.
+    pub fn corpus_stats(&self, since: u64) -> Snapshot {
+        let ix = self.index.read().unwrap();
+        let mut total = LedgerTally::default();
+        let mut no_isa = LedgerTally::default();
+        let mut by_isa: HashMap<u32, LedgerTally> = HashMap::new();
+        let mut by_format: HashMap<u32, LedgerTally> = HashMap::new();
+        let mut donors = HashSet::new();
+        let (mut first, mut last, mut recent) = (u64::MAX, 0u64, 0u64);
+        let add = |t: &mut LedgerTally, bytes: u64| {
+            t.files += 1;
+            t.bytes += bytes;
+        };
+        for r in ix.rows.iter().filter(|r| r.posted_at > 0 && !r.hidden) {
+            add(&mut total, r.size);
+            if r.isas.is_empty() {
+                add(&mut no_isa, r.size);
+            }
+            for &isa in r.isas.iter() {
+                add(by_isa.entry(isa).or_default(), r.size);
+            }
+            if r.format != 0 {
+                add(by_format.entry(r.format).or_default(), r.size);
+            }
+            if &*ix.donor.keys[r.donor as usize] != "anonymous" {
+                donors.insert(r.donor);
+            }
+            first = first.min(r.posted_at);
+            last = last.max(r.posted_at);
+            if r.posted_at >= since {
+                recent += 1;
+            }
+        }
+        let sorted = |m: HashMap<u32, LedgerTally>, dict: &Dict| {
+            let mut v: Vec<(String, LedgerTally)> = m.into_iter().map(|(id, t)| (dict.keys[id as usize].to_string(), t)).collect();
+            v.sort_by(|a, b| b.1.files.cmp(&a.1.files).then_with(|| a.0.cmp(&b.0)));
+            v
+        };
+        Snapshot {
+            total,
+            isas: sorted(by_isa, &ix.isa),
+            no_isa,
+            formats: sorted(by_format, &ix.format),
+            donors: donors.len(),
+            first_at: (first != u64::MAX).then_some(first),
+            last_at: (last > 0).then_some(last),
+            recent,
+        }
     }
 
     fn resolve(ix: &Index, q: &Query) -> Vec<Resolved> {
@@ -1239,7 +1303,7 @@ impl Catalog {
     }
 
     fn fails(ix: &Index, row: &Row, q: &Query, filters: &[Resolved], words: &Words) -> u32 {
-        let mut fails = 0;
+        let mut fails = if row.hidden { HIDDEN } else { 0 };
         for f in filters {
             let mut buf = [0];
             if !f.matches(ix.values(row, f.dim, q.isa_any, &mut buf)) {
@@ -1322,6 +1386,7 @@ impl Catalog {
         let ix = self.index.read().unwrap();
         ids.iter()
             .filter_map(|&i| ix.rows.get(i as usize))
+            .filter(|r| !r.hidden)
             .map(|r| (hex::encode(r.sha), r.stored, ix.row_json(r)))
             .collect()
     }
@@ -1656,6 +1721,7 @@ fn clone_meta(p: &Row) -> Row {
         stored: p.stored,
         has_record: p.has_record,
         unrecovered: p.unrecovered.clone(),
+        hidden: p.hidden,
     }
 }
 
@@ -1702,6 +1768,8 @@ mod tests {
             name: donor.into(),
             original_name: format!("fw{n}.bin"),
             zrax: z,
+            unclassified: None,
+            checked: None,
             received_at: at,
             source: "upload".into(),
             telegram: None,
@@ -1745,7 +1813,7 @@ mod tests {
         let c = Catalog::new();
         // A live record arrives before the loader reads an older copy of it.
         let mut live = record(5, "kenan", 10, Some(summary("elf", Some("arm"), &[])), 50);
-        live.telegram = Some(Posted { chat_id: -1003917356862, message_id: 9 << 20, posted_at: 60 });
+        live.telegram = Some(Posted::new(-1003917356862, 9 << 20, 60));
         c.put(&live, Path::new("/nonexistent"));
         let stale = record(5, "kenan", 10, Some(summary("elf", Some("arm"), &[])), 50);
         std::fs::write(dir.path().join(format!("{}.json", stale.sha256)), serde_json::to_vec(&stale).unwrap()).unwrap();
@@ -1914,5 +1982,69 @@ mod tests {
             assert!(start <= unix && unix < end, "{label}");
             assert_eq!(label, &crate::ledger::date(unix)[..7]);
         }
+    }
+
+    #[test]
+    fn unclassified_rows_are_hidden_everywhere() {
+        let c = catalog();
+        let i8051 = hex::encode([2u8; 32]);
+        let mut gone = record(2, "kenan", 50, Some(summary("raw", Some("i8051"), &[])), 200);
+        gone.unclassified =
+            Some(crate::firmwares::Unclassified { zrax: "0.1.0@new".into(), since: 300, reason: "unrecognized by zrax".into() });
+        c.put(&gone, Path::new("/nonexistent"));
+        let v = c.query(&q(&[("tree", "family,isa"), ("matrix", "isa,format"), ("facets", "1")]));
+        assert_eq!(v["total"], 3);
+        assert!(!shas(&v).contains(&"fw2.bin".to_string()));
+        let isas: Vec<&str> = v["facets"]["isa"]["values"].as_array().unwrap().iter().map(|x| x["key"].as_str().unwrap()).collect();
+        assert!(!isas.contains(&"i8051"), "{isas:?}");
+        assert!(v["tree"]["nodes"].as_array().unwrap().iter().all(|n| n["key"] != "mcs"));
+        assert_eq!(v["hist"]["size"].as_array().unwrap().iter().map(|b| b["files"].as_u64().unwrap()).sum::<u64>(), 3);
+        // Not even a filter, the status facet or a search finds it.
+        assert_eq!(c.query(&q(&[("isa", "i8051")]))["total"], 0);
+        assert_eq!(c.query(&q(&[("q", "fw2")]))["total"], 0);
+        assert_eq!(c.query(&q(&[("status", "queued")]))["total"], 2, "the two other unposted records");
+        assert!(c.detail(&i8051).is_none());
+        assert!(c.stored_name(&i8051).is_none(), "no downloads");
+        assert!(c.detail(&hex::encode([1u8; 32])).unwrap().1.is_empty());
+        let ids: Vec<u32> = (0..4).collect();
+        assert_eq!(c.export_rows(&ids).len(), 3, "an export skips it");
+        let s = c.summary(1_000, "0.1.0@abc");
+        assert_eq!(s["files"], 3);
+        assert_eq!(s["unclassified"]["files"], 1);
+        assert!(s["wanted"].as_array().unwrap().iter().any(|w| w["isa"] == "i8051"), "nobody else has an 8051 image");
+
+        // A later zrax accepts it again.
+        gone.unclassified = None;
+        c.put(&gone, Path::new("/nonexistent"));
+        assert_eq!(c.query(&q(&[]))["total"], 4);
+        assert!(c.detail(&i8051).is_some());
+    }
+
+    #[test]
+    fn corpus_stats_count_posted_images_as_classified_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = crate::ledger::Ledger::open(&dir.path().join("posted.jsonl")).unwrap();
+        let entries = vec![entry(1, "arm", 100), entry(2, "mips", 200), entry(3, "arm", 300)];
+        for e in &entries {
+            ledger.record(e).unwrap();
+        }
+        let c = Catalog::new();
+        c.load(&entries, &[-1003917356862; 3], dir.path());
+        assert_eq!(c.corpus_stats(250), ledger.snapshot(250), "nothing reclassified: the ledger's numbers");
+
+        // File 3 is an 8051 image now, file 2 is rejected, a stored file
+        // that wasn't posted yet doesn't count.
+        let mut three = record(3, "anonymous", 300, Some(summary("raw", Some("i8051"), &[])), 300);
+        three.telegram = Some(Posted::new(-1003917356862, 3 << 20, 300));
+        c.put(&three, Path::new("/nonexistent"));
+        let mut two = record(2, "anonymous", 200, Some(summary("raw", Some("mips"), &[])), 200);
+        two.telegram = Some(Posted::new(-1003917356862, 2 << 20, 200));
+        two.unclassified = Some(crate::firmwares::Unclassified { zrax: "z".into(), since: 1, reason: "r".into() });
+        c.put(&two, Path::new("/nonexistent"));
+        c.put(&record(9, "kenan", 5, Some(summary("elf", Some("arm"), &[])), 400), Path::new("/nonexistent"));
+        let s = c.corpus_stats(250);
+        assert_eq!((s.total.files, s.total.bytes), (2, 400));
+        assert_eq!(s.isas.iter().map(|(k, t)| (k.as_str(), t.files)).collect::<Vec<_>>(), [("arm", 1), ("i8051", 1)]);
+        assert_eq!((s.first_at, s.last_at, s.recent, s.donors), (Some(100), Some(300), 1, 0));
     }
 }

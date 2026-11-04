@@ -142,12 +142,35 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
+/// The corpus as classified now (the dashboard's index, without the files
+/// the current zrax rejects), or the ledger's view until the index is built.
+async fn corpus(state: &AppState, now: u64) -> crate::ledger::Snapshot {
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, crate::ledger::Snapshot)>> = std::sync::Mutex::new(None);
+    let since = now.saturating_sub(3600);
+    let catalog = state.dashboard.catalog.clone();
+    if !catalog.ready() {
+        return state.ledger.snapshot(since);
+    }
+    if let Some((at, snap)) = CACHE.lock().unwrap().as_ref() {
+        if at.elapsed() < std::time::Duration::from_secs(2) {
+            return snap.clone();
+        }
+    }
+    match tokio::task::spawn_blocking(move || catalog.corpus_stats(since)).await {
+        Ok(snap) => {
+            *CACHE.lock().unwrap() = Some((std::time::Instant::now(), snap.clone()));
+            snap
+        }
+        Err(_) => state.ledger.snapshot(since),
+    }
+}
+
 /// Corpus statistics for the page: totals, files per ISA (every ISA the
 /// raw-code model knows is listed, with zero when nobody donated one yet),
 /// and files per format.
 async fn stats(State(state): State<AppState>) -> impl IntoResponse {
     let now = unix_now();
-    let snap = state.ledger.snapshot(now.saturating_sub(3600));
+    let snap = corpus(&state, now).await;
     let raw = raw_isas();
     let is_raw = |key: &str| raw.iter().any(|r| r.key == key);
     let mut isas: Vec<serde_json::Value> = snap

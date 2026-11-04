@@ -92,6 +92,9 @@ async fn summary(State(state): State<AppState>, Path(key): Path<String>) -> Resu
     let catalog = d.catalog.clone();
     let mut v = tokio::task::spawn_blocking(move || catalog.summary(now, &zrax_label())).await.map_err(ApiError::internal)?;
     v["backfill"] = serde_json::to_value(&*d.backfill.lock().unwrap()).unwrap_or(Value::Null);
+    let mut reclassify = serde_json::to_value(&*d.reclassify.lock().unwrap()).unwrap_or(Value::Null);
+    reclassify["edits"] = serde_json::to_value(d.edits.counts()).unwrap_or(Value::Null);
+    v["reclassify"] = reclassify;
     v["arriving"] = Value::Array(state.uploads.arriving());
     v["queue"] = json!({
         "queued": state.queue.len(),

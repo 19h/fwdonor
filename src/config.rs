@@ -35,6 +35,27 @@ pub struct Config {
     pub policy: Policy,
     pub telegram: Telegram,
     pub bulk: Bulk,
+    pub reclassify: Reclassify,
+}
+
+/// Re-running zrax over the store after a zrax update (src/reclassify.rs).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Reclassify {
+    /// Off: stored files keep the classification they have (for a rollback
+    /// that shouldn't touch thousands of posts).
+    pub enabled: bool,
+    /// Files analyzed at once, on threads at the lowest CPU and I/O priority.
+    pub threads: usize,
+    /// Bytes of files being analyzed at once, in MiB (a file counts at least
+    /// 1 MiB): bounds memory next to the live verification.
+    pub memory_mib: u64,
+}
+
+impl Default for Reclassify {
+    fn default() -> Self {
+        Self { enabled: true, threads: 3, memory_mib: 768 }
+    }
 }
 
 /// Bulk donations: grant links whose uploads stay on this server.
@@ -129,6 +150,7 @@ impl Default for Config {
             policy: Policy::default(),
             telegram: Telegram::default(),
             bulk: Bulk::default(),
+            reclassify: Reclassify::default(),
         }
     }
 }
@@ -219,6 +241,8 @@ impl Config {
             "bulk.chunk_bytes must be a multiple of 1 MiB, at most 16 MiB"
         );
         anyhow::ensure!(b.max_puts > 0 && b.max_puts_per_grant > 0, "bulk.max_puts* must be > 0");
+        let r = &self.reclassify;
+        anyhow::ensure!(r.threads > 0 && r.memory_mib > 0, "reclassify.threads and memory_mib must be > 0");
         Ok(())
     }
 
@@ -228,6 +252,11 @@ impl Config {
 
     pub fn ledger_path(&self) -> PathBuf {
         self.runtime_dir.join("posted.jsonl")
+    }
+
+    /// The files being reclassified right now (see src/reclassify.rs).
+    pub fn reclassify_inflight_path(&self) -> PathBuf {
+        self.runtime_dir.join("reclassify.inflight")
     }
 
     pub fn zrax_revs_path(&self) -> PathBuf {

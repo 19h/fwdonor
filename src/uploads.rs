@@ -618,11 +618,7 @@ impl Uploads {
         drop(sessions);
         if !posted_before_crash.is_empty() {
             for entry in self.ledger.entries()?.into_iter().filter(|e| posted_before_crash.contains_key(&e.sha256)) {
-                let posted = Posted {
-                    chat_id: self.config.telegram.chat_id,
-                    message_id: entry.message_id,
-                    posted_at: entry.posted_at,
-                };
+                let posted = Posted::new(self.config.telegram.chat_id, entry.message_id, entry.posted_at);
                 if let Err(e) = self.firmwares.mark_posted(&entry.sha256, posted) {
                     tracing::error!(sha256 = %entry.sha256, "noting the post in the firmware record failed: {e}");
                 }
