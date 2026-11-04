@@ -1,0 +1,10 @@
+# /data/fwdonor/fwdonor.toml — production (defaults cover everything else;
+# see src/config.rs for every knob, including the policy format lists).
+bind = "127.0.0.1:18090"
+dist_dir = "/data/fwdonor/dist"
+runtime_dir = "/data/fwdonor/runtime"
+spool_dir = "/data/fwdonor/spool"
+
+[telegram]
+chat_id = -1003917356862
+tdjson = "/data/fwdonor/tdlib/lib/libtdjson.so"

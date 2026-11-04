@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="dark">
+<meta name="robots" content="noindex, nofollow">
+<title>fwdonor · dashboard · bulk</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23ff3d8b'/%3E%3Cpath d='M4 4h8v2H7v1h4v2H7v3H4z' fill='%23080706'/%3E%3C/svg%3E">
+<!-- Served at /d/<key>/bulk: asset URLs are relative to dist/d/bulk/. -->
+<link rel="stylesheet" href="../../fwdonor.css">
+<script type="module" src="../../dash-bulk.js"></script>
+</head>
+<body class="dash">
+<div class="page">
+<header class="bar brand">
+  <a href="https://zr.ax/" class="home"><strong>zrax</strong></a><span class="slash">/</span><a href="/" class="home"><strong>fwdonor</strong></a><span class="slash">/</span><strong class="accent-text">dashboard</strong>
+  <nav class="tabs"><a data-tab="firmware">firmware</a><a data-tab="bulk" class="on">bulk</a></nav>
+  <span class="spacer"></span>
+  <span class="muted" id="updated"></span>
+  <button type="button" id="tz" class="tz" title="Switch between UTC and local time"></button>
+</header>
+
+<main class="main dash-main">
+  <div class="error-banner" id="banner" role="alert" hidden></div>
+
+  <section class="dash-stats panel" aria-label="totals">
+    <div class="big"><strong id="s-files">–</strong><span id="s-files-sub">bulk files stored</span></div>
+    <div><strong id="s-links">–</strong><span id="s-links-sub">open links</span></div>
+    <div><strong id="s-active">–</strong><span id="s-active-sub">uploads in progress</span></div>
+    <div><strong id="s-speed">–</strong><span id="s-speed-sub">combined speed</span></div>
+    <div><strong id="s-disk">–</strong><span id="s-disk-sub">disk free</span></div>
+    <div><strong id="s-claim">–</strong><span id="s-claim-sub">open links can still claim</span></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><h2>[ links ] <span id="grant-count" class="muted">0</span></h2><span class="spacer"></span>
+      <span class="muted">issued on the bulk-links admin page; click one to filter the lists below</span></div>
+    <div class="table-wrap"><table class="table compact grants dash-grants">
+      <thead><tr><th>name</th><th>id</th><th class="num">ceiling</th><th class="usage-col">used</th><th class="num">files</th>
+        <th class="num">unfinished</th><th>created</th><th>last file</th><th>state</th></tr></thead>
+      <tbody id="grant-rows"></tbody></table></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><h2>[ in progress ] <span id="up-count" class="muted">0</span></h2><span class="spacer"></span>
+      <span class="muted">received chunks, then hashing; stalled after 2 min without a chunk</span></div>
+    <div class="table-wrap"><table class="table bulk-table dash-uploads">
+      <thead><tr><th>link</th><th>file</th><th class="num">size</th><th class="progress-col">received</th><th>hashed</th>
+        <th class="num">speed</th><th class="num">eta</th><th class="num">streams</th><th>started</th><th>last chunk</th></tr></thead>
+      <tbody id="up-rows"></tbody></table></div>
+  </section>
+
+  <div class="dash-body">
+    <aside class="panel dash-tree" aria-label="folders">
+      <div class="panel-head"><h2>[ folders ]</h2><span class="spacer"></span><button type="button" id="folder-clear">all</button></div>
+      <ul class="tree" id="tree" role="tree"></ul>
+    </aside>
+    <section class="panel results-panel dash-content">
+      <div class="panel-head">
+        <h2>[ stored ] <span id="file-count">0</span></h2>
+        <span class="muted" id="file-sel"></span>
+        <input type="search" id="search" placeholder="search names, paths, sha256" spellcheck="false" autocomplete="off">
+        <span class="spacer"></span>
+        <details class="menu"><summary>export</summary><div class="menu-body">
+          <a id="x-csv" download>CSV</a><a id="x-ndjson" download>NDJSON</a><a id="x-sum" download>sha256sum</a><a id="x-rsync" download>rsync file list</a>
+          <p class="muted">Fetch the files of an rsync list with:</p><code id="rsync-cmd"></code>
+          <p class="muted">Downloads resume with <code>curl -C - -o NAME URL</code>.</p>
+        </div></details>
+      </div>
+      <div class="table-wrap"><table class="table bulk-files">
+        <thead id="file-head"></thead><tbody id="file-rows"></tbody></table></div>
+    </section>
+  </div>
+</main>
+
+<footer class="status-bar">
+  <span class="status-mode">fwdonor dashboard · bulk</span>
+  <span id="status">loading</span>
+</footer>
+</div>
+</body>
+</html>

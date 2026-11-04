@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="dark">
+<meta name="robots" content="noindex, nofollow">
+<title>fwdonor · bulk links</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23ff3d8b'/%3E%3Cpath d='M4 4h8v2H7v1h4v2H7v3H4z' fill='%23080706'/%3E%3C/svg%3E">
+<!-- Served at /g/<key>: asset URLs are relative to dist/g/. -->
+<link rel="stylesheet" href="../fwdonor.css">
+<script type="module" src="../grant.js"></script>
+</head>
+<body>
+<div class="page">
+<header class="bar brand">
+  <a href="https://zr.ax/" class="home"><strong>zrax</strong></a><span class="slash">/</span><strong>fwdonor</strong><span class="slash">/</span><strong class="accent-text">bulk links</strong>
+  <span class="spacer"></span>
+  <span class="muted">admin · keep this URL private</span>
+</header>
+
+<main class="main">
+  <div class="error-banner" id="banner" role="alert" hidden></div>
+
+  <section class="intro">
+    <h1>[ issue a bulk link ]</h1>
+    <p>A bulk link lets one donor upload files of any size straight to this server, outside the Telegram pipeline.
+      Everything uploaded with it is credited to the name you give here and counts against its storage ceiling.</p>
+    <p class="muted">Files are stored under their SHA-256 in <code id="store-dir">…</code>, next to a JSON record with the
+      link, the name, the original file name and the uploader's address. Revoking a link stops further uploads and
+      discards its unfinished ones; stored files stay.</p>
+  </section>
+
+  <section class="panel grant-new">
+    <form id="grant-form" class="grant-form" novalidate>
+      <label><span>[ donor name ]</span>
+        <input id="g-name" type="text" maxlength="32" spellcheck="false" autocomplete="off"
+               pattern="[A-Za-z0-9_.\-]{1,32}" placeholder="Sonic">
+        <small class="muted">Letters, digits and _ . - only. Shown, fixed, on the upload page.</small>
+      </label>
+      <label><span>[ storage ceiling ]</span>
+        <span class="amount">
+          <input id="g-amount" type="number" min="0.001" step="any" value="500">
+          <select id="g-unit"><option value="1e9" selected>GB</option><option value="1e12">TB</option></select>
+        </span>
+        <small class="muted">The most this link may store in total (1 GB = 10⁹ bytes).</small>
+      </label>
+      <label class="wide"><span>[ note ]</span>
+        <input id="g-note" type="text" maxlength="200" autocomplete="off" placeholder="optional, only shown here">
+      </label>
+      <div class="actions"><button type="submit" class="primary" id="g-submit">create link</button><span class="muted" id="g-error"></span></div>
+    </form>
+    <div class="grant-result" id="grant-result" hidden>
+      <span>[ new link ] for <strong id="r-name"></strong>, <span id="r-ceiling"></span>:</span>
+      <code id="r-url"></code>
+      <button type="button" id="r-copy">copy</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>[ links ] <span id="grant-count">0</span></h2>
+      <span class="spacer"></span>
+      <span class="muted" id="disk"></span>
+    </div>
+    <div class="table-wrap">
+      <table class="table compact grants">
+        <thead><tr>
+          <th>name</th><th>note</th><th class="num">ceiling</th><th class="usage-col">used</th>
+          <th class="num">files</th><th class="num">unfinished</th><th>created</th><th></th>
+        </tr></thead>
+        <tbody id="grant-rows"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<footer class="status-bar">
+  <span class="status-mode">fwdonor bulk links</span>
+  <span id="status">loading</span>
+</footer>
+</div>
+</body>
+</html>

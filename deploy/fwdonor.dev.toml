@@ -1,0 +1,14 @@
+# Local testing: no Telegram, everything under the repo.
+bind = "127.0.0.1:18090"
+dist_dir = "dist"
+runtime_dir = "runtime"
+spool_dir = "spool"
+firmware_dir = "firmwares"
+public_url = "http://127.0.0.1:18090"
+
+[bulk]
+dir = "bulk"
+min_free_bytes = 0
+
+[telegram]
+dry_run = true

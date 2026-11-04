@@ -1,0 +1,11 @@
+target/
+vendor/
+dist/
+runtime/
+spool/
+node_modules/
+*.log
+.DS_Store
+dist.next/
+dist.old/
+firmwares/*

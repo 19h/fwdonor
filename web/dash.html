@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="dark">
+<meta name="robots" content="noindex, nofollow">
+<title>fwdonor · dashboard</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23ff3d8b'/%3E%3Cpath d='M4 4h8v2H7v1h4v2H7v3H4z' fill='%23080706'/%3E%3C/svg%3E">
+<!-- Served at /d/<key>: asset URLs are relative to dist/d/. -->
+<link rel="stylesheet" href="../fwdonor.css">
+<script type="module" src="../dash.js"></script>
+</head>
+<body class="dash">
+<div class="page">
+<header class="bar brand">
+  <a href="https://zr.ax/" class="home"><strong>zrax</strong></a><span class="slash">/</span><a href="/" class="home"><strong>fwdonor</strong></a><span class="slash">/</span><strong class="accent-text">dashboard</strong>
+  <nav class="tabs private-only"><a data-tab="firmware" class="on">firmware</a><a data-tab="bulk">bulk <span id="bulk-badge" class="muted"></span></a></nav>
+  <a href="/" class="donate-link public-only" hidden>donate firmware ›</a>
+  <span class="spacer"></span>
+  <button type="button" id="live" class="live-toggle on" title="Follow new donations (L)"><i></i><span>live</span></button>
+  <span class="muted" id="updated"></span>
+  <button type="button" id="tz" class="tz" title="Switch between UTC and local time"></button>
+  <button type="button" id="help-open" title="Keyboard shortcuts (?)">?</button>
+</header>
+
+<main class="main dash-main">
+  <div class="error-banner" id="banner" role="alert" hidden></div>
+  <div class="indexing panel" id="indexing" hidden>
+    <span>[ indexing the store ]</span><progress id="index-progress" max="1" value="0"></progress><span class="muted" id="index-text"></span>
+  </div>
+
+  <section class="dash-stats panel" aria-label="totals">
+    <div class="big"><strong id="s-files">–</strong><span id="s-bytes">donated images</span></div>
+    <div class="private-only"><strong id="s-stored">–</strong><span id="s-stored-sub">in the store</span>
+      <div class="coverage"><i class="cov-stored" id="cov-stored"></i><i class="cov-queued" id="cov-queued"></i></div></div>
+    <div class="private-only"><strong id="s-backfill">–</strong><span id="s-backfill-sub">backfill</span></div>
+    <div><strong id="s-recent">–</strong><span id="s-recent-sub">last 24 h</span></div>
+    <div><strong id="s-donors">–</strong><span id="s-donors-sub">donors</span></div>
+    <div><strong id="s-isas">–</strong><span id="s-isas-sub">ISAs</span></div>
+    <div class="private-only"><strong id="s-queue">–</strong><span id="s-queue-sub">arriving</span></div>
+    <div class="private-only"><strong id="s-disk">–</strong><span id="s-disk-sub">disk free</span></div>
+  </section>
+
+  <details class="panel arriving private-only" id="arriving-panel">
+    <summary><h2>[ arriving now ] <span id="arriving-count" class="muted">0</span></h2></summary>
+    <div class="table-wrap"><table class="table compact"><thead><tr>
+      <th>state</th><th>file</th><th>donor</th><th class="num">size</th><th>progress</th><th>zrax</th><th class="num">idle</th>
+    </tr></thead><tbody id="arriving-rows"></tbody></table></div>
+  </details>
+
+  <div class="dash-body">
+    <aside class="panel dash-tree" aria-label="tree">
+      <div class="panel-head"><h2>[ tree ]</h2><span class="spacer"></span>
+        <button type="button" id="tree-metric" title="Count files or bytes">files</button>
+        <button type="button" id="isa-mode" title="Count every ISA a file contains, or only its primary ISA">any ISA</button>
+      </div>
+      <div class="tree-levels" id="tree-levels"></div>
+      <input type="search" id="tree-filter" placeholder="filter the tree" spellcheck="false" autocomplete="off">
+      <div class="crumbs" id="crumbs"></div>
+      <ul class="tree" id="tree" role="tree"></ul>
+      <details class="wanted" id="wanted-panel">
+        <summary>ISAs nobody has donated yet <span id="wanted-count" class="muted"></span></summary>
+        <ul id="wanted"></ul>
+      </details>
+    </aside>
+
+    <div class="dash-content">
+      <div class="filter-bar panel">
+        <div class="scope" id="scope" role="group" aria-label="firmware or other binaries"></div>
+        <input type="search" id="search" placeholder="search names, sha256, donors, metadata  ( / )" spellcheck="false" autocomplete="off">
+        <label class="check" title="Only files with two or more different ISAs"><input type="checkbox" id="multi"> multi-ISA</label>
+        <div class="chips" id="chips"></div>
+        <span class="spacer"></span>
+        <span class="selection-total" id="total"></span>
+      </div>
+
+      <section class="panel charts">
+        <div class="chart wide"><div class="chart-head"><span>[ received ]</span><span class="muted" id="time-step"></span><span class="spacer"></span><button type="button" id="hist-metric">files</button></div><div class="chart-body" id="h-time"></div></div>
+        <div class="chart"><div class="chart-head"><span>[ size ]</span><span class="muted">log₂ buckets</span></div><div class="chart-body" id="h-size"></div></div>
+        <div class="chart"><div class="chart-head"><span>[ confidence ]</span></div><div class="chart-body" id="h-conf"></div></div>
+      </section>
+
+      <section class="facets" id="facets" aria-label="facets"></section>
+
+      <details class="panel matrix-panel" id="matrix-panel">
+        <summary><h2>[ matrix ]</h2>
+          <span class="matrix-dims"><select id="matrix-a"></select> × <select id="matrix-b"></select></span></summary>
+        <div class="table-wrap"><table class="table compact matrix" id="matrix"></table></div>
+      </details>
+
+      <section class="panel results-panel">
+        <div class="panel-head">
+          <h2>[ files ] <span id="count">0</span></h2>
+          <span class="muted" id="sel-info"></span>
+          <span class="spacer"></span>
+          <span class="sel-actions" id="sel-actions" hidden>
+            <button type="button" id="sel-copy">copy sha256</button>
+            <button type="button" id="sel-csv">csv</button>
+            <button type="button" id="sel-sum">sha256sum</button>
+            <button type="button" id="sel-rsync" class="private-only">rsync list</button>
+            <button type="button" id="sel-clear">clear</button>
+          </span>
+          <details class="menu" id="export-menu"><summary>export all matching</summary>
+            <div class="menu-body">
+              <a id="x-csv" download>CSV</a><a id="x-ndjson" download>NDJSON (full records)</a>
+              <a id="x-sum" download>sha256sum</a><a id="x-rsync" class="private-only" download>rsync file list</a>
+              <p class="muted private-only">Fetch the files of an rsync list with:</p><code id="rsync-cmd" class="private-only"></code>
+              <p class="muted public-only" hidden>Scripted downloads: <code>GET /api/dashboard/challenge</code>, find <code>proofs</code> different nonces of <code>bits</code> each for the file (as fwdonate does for uploads), then <code>GET /api/dashboard/files/&lt;sha256&gt;/download?token=…&amp;nonces=n1,n2,…</code> in increasing order.</p>
+            </div></details>
+          <details class="menu" id="columns-menu"><summary>columns</summary><div class="menu-body" id="columns"></div></details>
+          <select id="limit" title="Rows per page"><option>50</option><option selected>100</option><option>250</option><option>500</option></select>
+        </div>
+        <div class="table-wrap"><table class="table files-table" id="files"><thead id="files-head"></thead><tbody id="files-rows"></tbody></table></div>
+        <div class="pager"><button type="button" id="prev">‹ prev</button><span id="page-info"></span><button type="button" id="next">next ›</button></div>
+      </section>
+    </div>
+  </div>
+</main>
+
+<aside class="drawer" id="drawer" hidden aria-label="file details">
+  <div class="drawer-head"><button type="button" id="d-prev" title="Previous file ([)">‹</button><button type="button" id="d-next" title="Next file (])">›</button>
+    <strong id="d-name"></strong><span class="spacer"></span><button type="button" id="d-close" title="Close (Esc)">×</button></div>
+  <div class="drawer-body" id="d-body"></div>
+</aside>
+
+<div class="help" id="help" hidden><div class="panel">
+  <div class="panel-head"><h2>[ keys ]</h2><span class="spacer"></span><button type="button" id="help-close">×</button></div>
+  <dl><dt>/</dt><dd>search</dd><dt>j k ↓ ↑</dt><dd>move through the files</dd><dt>Enter</dt><dd>open the file</dd>
+    <dt>Esc</dt><dd>close</dd><dt>[ ]</dt><dd>previous / next page (or file, with the details open)</dd><dt>x</dt><dd>select the file</dd>
+    <dt>L</dt><dd>live on / off</dd><dt>click / alt-click</dt><dd>a facet or tree value: only these / all but these</dd>
+    <dt>shift-click</dt><dd>a column: sort by it next</dd><dt>drag</dt><dd>across a chart: filter to that range</dd></dl>
+</div></div>
+
+<footer class="status-bar">
+  <span class="status-mode">fwdonor dashboard</span>
+  <span id="status">loading</span>
+  <span class="spacer"></span>
+  <span id="status-zrax" class="muted"></span>
+</footer>
+</div>
+</body>
+</html>

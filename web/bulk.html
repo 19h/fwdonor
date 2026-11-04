@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="dark">
+<meta name="robots" content="noindex, nofollow">
+<title>fwdonor · bulk donation</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23ff3d8b'/%3E%3Cpath d='M4 4h8v2H7v1h4v2H7v3H4z' fill='%23080706'/%3E%3C/svg%3E">
+<!-- Served at /r/<token>: asset URLs are relative to dist/r/. -->
+<link rel="stylesheet" href="../fwdonor.css">
+<script type="module" src="../bulk.js"></script>
+</head>
+<body>
+<div class="page">
+<header class="bar brand">
+  <a href="https://zr.ax/" class="home"><strong>zrax</strong></a><span class="slash">/</span><strong>fwdonor</strong><span class="slash">/</span><strong class="accent-text">bulk</strong>
+  <span class="muted" id="grant-label">loading…</span>
+  <span class="spacer"></span>
+  <a class="muted" href="https://zr.ax/">workbench ↗</a>
+</header>
+
+<main class="main">
+  <div class="error-banner" id="banner" role="alert" hidden></div>
+  <div class="error-banner warn" id="notice" role="status" hidden></div>
+
+  <section class="intro">
+    <h1>[ bulk donation ]</h1>
+    <p>This link is for large firmware donations. Files of any size go straight to the zr.ax server, not to
+      Telegram. They are stored there under their SHA-256 and credited to the name below.</p>
+    <p class="muted">Uploads continue on their own when the connection drops or the server restarts. If this tab is
+      closed or the computer sleeps, drop the same files here again: each one continues where it stopped, and only
+      the missing parts are sent. Please only donate images you have the right to share.</p>
+  </section>
+
+  <section class="controls bulk-controls">
+    <div class="bulk-side">
+      <label class="donor">
+        <span>[ donor name ]</span>
+        <input id="donor" type="text" disabled aria-describedby="donor-hint">
+        <small id="donor-hint" class="muted">Fixed for this link: everything uploaded here is credited to this name.</small>
+      </label>
+      <div class="quota" id="quota" aria-live="polite">
+        <div class="quota-head"><span>[ storage ]</span><span class="spacer"></span><span id="quota-total">—</span></div>
+        <div class="quota-bar" id="quota-bar" role="img" aria-label="storage quota">
+          <i class="used" id="quota-used-bar"></i><i class="reserved" id="quota-reserved-bar"></i>
+        </div>
+        <div class="quota-legend">
+          <span><b class="sw used"></b>stored <em id="quota-used">—</em></span>
+          <span><b class="sw reserved"></b>in progress <em id="quota-reserved">—</em></span>
+          <span><b class="sw free"></b>free <em id="quota-free">—</em></span>
+        </div>
+        <small class="muted" id="quota-files"></small>
+      </div>
+    </div>
+    <div class="bulk-drop">
+      <button class="dropzone" id="dropzone" type="button">
+        <strong>drop files or folders anywhere</strong>
+        <span>or <em>browse files</em></span>
+        <small>any size · nothing is analyzed in the browser · resumable</small>
+      </button>
+      <div class="pick-row">
+        <button type="button" id="pick-files">browse files</button>
+        <button type="button" id="pick-folder">browse a folder</button>
+      </div>
+    </div>
+    <input type="file" id="fileinput" multiple hidden>
+    <input type="file" id="folderinput" webkitdirectory multiple hidden>
+  </section>
+
+  <section class="panel unfinished" id="unfinished" hidden>
+    <div class="panel-head"><h2>[ unfinished uploads ] <span id="unfinished-count">0</span></h2></div>
+    <p class="muted">These stopped before they were complete, and their size stays reserved. Drop the same file again to
+      continue it where it stopped, or discard it.</p>
+    <div class="table-wrap">
+      <table class="table compact">
+        <thead><tr><th>file</th><th class="num">size</th><th class="num">received</th><th>last activity</th><th></th></tr></thead>
+        <tbody id="unfinished-rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel transfer" id="transfer" hidden>
+    <div class="panel-head">
+      <h2>[ transfer ]</h2>
+      <span class="pill" id="server-state">connected</span>
+      <span class="spacer"></span>
+      <span class="muted" id="streams"></span>
+    </div>
+    <div class="transfer-grid">
+      <div class="big"><strong id="t-done">0 B</strong><span>of <span id="t-total">0 B</span> · <span id="t-pct">0%</span></span></div>
+      <div><strong id="t-speed">—</strong><span>now</span></div>
+      <div><strong id="t-avg">—</strong><span>average</span></div>
+      <div><strong id="t-eta">—</strong><span>remaining</span></div>
+      <div><strong id="t-elapsed">0:00</strong><span>elapsed</span></div>
+      <div><strong id="t-files">0 / 0</strong><span>files stored</span></div>
+    </div>
+    <div class="spark-wrap">
+      <canvas id="spark" class="spark" aria-hidden="true"></canvas>
+      <span class="spark-label muted" id="spark-label"></span>
+    </div>
+    <progress id="t-progress" max="1" value="0"></progress>
+  </section>
+
+  <section class="results" id="results" hidden>
+    <div class="results-bar">
+      <h2>[ files ] <span id="count">0</span></h2>
+      <span class="tallies" id="tallies"></span>
+      <span class="spacer"></span>
+      <button type="button" id="retry" hidden>retry failed</button>
+      <button type="button" id="clear">clear finished</button>
+    </div>
+    <div class="table-wrap">
+      <table class="table bulk-table">
+        <thead><tr>
+          <th class="st"></th><th>file</th><th class="num">size</th><th class="progress-col">progress</th>
+          <th class="num">speed</th><th class="num">eta</th><th class="state-col">state</th>
+        </tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel log" id="log-section" hidden>
+    <details open>
+      <summary><h2>[ activity ] <span id="log-count">0</span></h2></summary>
+      <ol id="log"></ol>
+    </details>
+  </section>
+
+  <section class="panel stored" id="stored" hidden>
+    <details>
+      <summary><h2>[ stored with this link ] <span id="stored-count">0</span></h2></summary>
+      <div class="table-wrap">
+        <table class="table compact">
+          <thead><tr><th>file</th><th class="num">size</th><th>stored</th><th>sha256</th></tr></thead>
+          <tbody id="stored-rows"></tbody>
+        </table>
+      </div>
+    </details>
+  </section>
+</main>
+
+<footer class="status-bar">
+  <span class="status-mode">fwdonor bulk</span>
+  <span id="status">loading</span>
+  <span class="spacer"></span>
+  <span class="muted" id="status-grant"></span>
+</footer>
+</div>
+
+<div class="drag-overlay" id="drag-overlay" hidden>
+  <div><strong>drop to upload</strong><span>files and folders · files you dropped before continue where they stopped</span></div>
+</div>
+</body>
+</html>

@@ -1,0 +1,50 @@
+[Unit]
+Description=fwdonor firmware donation service (fwdonor.zr.ax)
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/data/fwdonor/runtime/telegram.json
+
+[Service]
+Type=simple
+User=fwdonor
+Group=fwdonor
+WorkingDirectory=/data/fwdonor
+Environment=RUST_LOG=info
+ExecStart=/data/fwdonor/target/release/fwdonor --config /data/fwdonor/fwdonor.toml serve
+Restart=on-failure
+# 78 = not logged in / bad config: retrying cannot help.
+RestartPreventExitStatus=78
+RestartSec=10s
+TimeoutStopSec=30s
+UMask=0077
+LimitNOFILE=65536
+# Up to two 512 MiB files are held in memory while zrax checks them.
+MemoryMax=6G
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RemoveIPC=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# bulk/: stored bulk donations (named by SHA-256) and their unfinished uploads.
+# firmwares/: every verified donation, named by SHA-256.
+ReadWritePaths=/data/fwdonor/runtime /data/fwdonor/spool /data/fwdonor/bulk /data/fwdonor/firmwares
+
+[Install]
+WantedBy=multi-user.target

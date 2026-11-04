@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="dark">
+<title>fwdonor · zrax</title>
+<meta name="description" content="Donate firmware images to the zrax corpus. Files are classified in your browser; only recognized firmware is uploaded.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23ff3d8b'/%3E%3Cpath d='M4 4h8v2H7v1h4v2H7v3H4z' fill='%23080706'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="./fwdonor.css">
+<script type="module" src="./app.js"></script>
+</head>
+<body>
+<div class="page" id="page">
+<header class="bar brand">
+  <a href="https://zr.ax/" class="home"><strong>zrax</strong></a><span class="slash">/</span><strong class="accent-text">fwdonor</strong>
+  <span class="muted" id="engine">loading engine…</span>
+  <span class="spacer"></span>
+  <a href="/dashboard">dashboard</a>
+  <a class="muted" href="https://zr.ax/">workbench ↗</a>
+</header>
+
+<main class="main">
+  <div class="error-banner" id="banner" role="alert" hidden></div>
+  <div class="error-banner warn" id="notice" role="status" hidden></div>
+
+  <section class="intro">
+    <h1>[ donate firmware ]</h1>
+    <p>Drop firmware images to grow the zrax corpus. zrax checks each file <em>in this tab</em> first.
+      Only images it recognizes are uploaded. The server checks them again, posts them to the
+      <a href="https://t.me/+QIr_pPECPMg2OTY0" target="_blank" rel="noopener noreferrer">zrax firmware group ↗</a>
+      on Telegram with what zrax found.</p>
+    <p class="muted">Images, documents, archives of non-firmware, ROMs and memory dumps are skipped and never leave your browser.
+      Each file can be up to <span id="limit">512 MiB</span>. Images already in the collection are recognized by their
+      SHA-256 and not uploaded again. Please only donate images you have the right to share.</p>
+  </section>
+
+  <section class="controls">
+    <label class="donor">
+      <span>[ donor name ]</span>
+      <input id="donor" type="text" maxlength="32" autocomplete="nickname" spellcheck="false" placeholder="anonymous"
+             pattern="[A-Za-z0-9_.\-]{0,32}" aria-describedby="donor-hint">
+      <small id="donor-hint" class="muted">Shown in the Telegram post, so you get credit. Letters, digits and _ . - only. Saved in this browser.</small>
+    </label>
+    <button class="dropzone" id="dropzone" type="button">
+      <strong>drop firmware anywhere</strong>
+      <span>or <em>browse files</em> · folders work too</span>
+      <small>classified locally · only recognized firmware is uploaded</small>
+    </button>
+    <input type="file" id="fileinput" multiple hidden>
+  </section>
+
+  <section class="thanks" id="thanks" hidden role="status" aria-live="polite"></section>
+
+  <section class="results" id="results" hidden>
+    <div class="results-bar">
+      <h2>[ files ] <span id="count">0</span></h2>
+      <span class="tallies" id="tallies"></span>
+      <span class="spacer"></span>
+      <button type="button" id="clear">clear finished</button>
+    </div>
+    <progress id="progress" max="1" value="0"></progress>
+    <div class="table-wrap">
+      <table class="table">
+        <thead><tr>
+          <th class="st"></th><th>file</th><th class="num">size</th><th>format</th><th>isa</th>
+          <th>bits · endian</th><th class="num">conf</th><th class="state-col">state</th>
+        </tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="corpus" id="corpus" hidden>
+    <div class="corpus-head">
+      <h2>[ corpus ]</h2>
+      <a href="/dashboard" class="corpus-explore">browse every image ›</a>
+      <span class="spacer"></span>
+      <span class="muted" id="corpus-last"></span>
+      <span class="live" aria-hidden="true">live</span>
+    </div>
+    <div class="corpus-totals">
+      <div class="big"><strong id="corpus-files">0</strong><span>images donated</span></div>
+      <div><strong id="corpus-bytes">0 B</strong><span>of firmware</span></div>
+      <div><strong id="corpus-hour">0</strong><span>in the last hour</span></div>
+      <div><strong id="corpus-isa-count">0</strong><span>ISAs so far</span></div>
+    </div>
+    <div class="corpus-grid">
+      <div class="corpus-isas">
+        <h3>images per isa</h3>
+        <ol id="corpus-isa-list"></ol>
+        <button type="button" id="corpus-more" hidden>show all</button>
+      </div>
+      <div class="corpus-wanted">
+        <h3>most wanted <span class="muted"><span id="corpus-wanted-count">0</span> isas</span></h3>
+        <p class="muted">zrax recognizes <span id="corpus-raw-count">0</span> ISAs from raw code. <span id="corpus-wanted-why">These still have fewer than
+          five images in the corpus, so firmware for them helps the most:</span></p>
+        <ul id="corpus-wanted"></ul>
+      </div>
+    </div>
+    <p class="corpus-formats" id="corpus-formats"></p>
+  </section>
+</main>
+
+<footer class="status-bar">
+  <span class="status-mode">fwdonor</span>
+  <span id="status">ready</span>
+  <span class="spacer"></span>
+  <span class="muted" id="status-zrax"></span>
+</footer>
+</div>
+
+<div class="drag-overlay" id="drag-overlay" hidden>
+  <div><strong>drop to donate</strong><span>files and folders · classified locally before anything is uploaded</span></div>
+</div>
+</body>
+</html>

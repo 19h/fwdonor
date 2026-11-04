@@ -1,0 +1,20 @@
+  fwdonor.zr.ax:80:
+    listen:
+      host: 0.0.0.0
+      port: 80
+      type: http
+    paths:
+      /:
+        redirect: https://fwdonor.zr.ax
+  fwdonor.zr.ax:443:
+    listen:
+      host: 0.0.0.0
+      port: 443
+      type: http
+      ssl:
+        minimum-version: TLSv1.2
+        letsencrypt: ON
+    paths:
+      /:
+        proxy.reverse.url: http://127.0.0.1:18090
+        proxy.preserve-host: ON

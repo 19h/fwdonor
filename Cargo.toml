@@ -1,0 +1,50 @@
+[package]
+name = "fwdonor"
+version = "0.1.0"
+edition = "2021"
+description = "Firmware donation drop-box: zrax-verified uploads forwarded to Telegram"
+license = "MIT OR Apache-2.0"
+publish = false
+default-run = "fwdonor"
+
+[dependencies]
+# Vendored at the commit in ZRAX_REV by scripts/vendor-zrax.sh. The same
+# checkout builds the browser WASM, so client and server verdicts agree.
+zrax = { path = "vendor/zrax", default-features = false }
+
+anyhow = "1.0"
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+bytes = "1"
+clap = { version = "4.4", features = ["derive", "env"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+hex = "0.4"
+libc = "0.2"
+libloading = "0.8"
+rand = "0.9"
+rpassword = "7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.11.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "signal", "sync", "time"] }
+toml = "0.8"
+tower-http = { version = "0.6", features = ["fs", "set-header"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.13", features = ["json"] }
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+# zrax's classifier is very slow without optimization; keep it fast in dev.
+[profile.dev.package.zrax]
+opt-level = 3
