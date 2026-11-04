@@ -14,11 +14,13 @@ pub const DEFAULT_ALLOW: &[&str] = &[
     "tix509", "tiasciihex", "titagged", "titekhex", "titxt",
     // MCU / record formats and update packages
     "mcuboot", "fip", "intelhex", "srec", "espfirmware", "espflash", "blackfinldr", "uf2",
-    "dfuse", "dfusuffix", "gbl", "cyacd", "silabsebl", "nordicinitpacket", "huaweiupdate", "ffu",
+    "dfuse", "dfusuffix", "gbl", "cyacd", "silabsebl", "nordicinitpacket", "ihex2fw", "huaweiupdate",
+    "ffu",
     // FPGA
     "xilinxbit", "latticebitstream", "intelfpga", "xilinxbootbin",
     // SoC boot images
-    "allwinneregon", "allwinnerimage", "rockchipimage", "mediatekpreloader", "qualcommmbn",
+    "allwinneregon", "allwinnerimage", "rockchipimage", "mediatekpreloader", "mediatekimage",
+    "qualcommmbn",
     "imximage", "nxpsb", "amlogicupgrade", "opteeimage", "bareboximage",
     // Kernels and device trees
     "zimage", "uimage", "fit", "dtb", "chromeoskernel",

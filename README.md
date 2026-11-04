@@ -152,7 +152,7 @@ A private, read-only view of everything donated: `/d/<dashboard key>` for the fi
   - **Mach-O:** dynamically linked executables are programs, dylibs and bundles are libraries, and static executables are firmware.
   - **Other formats:**
     - DEX, PEF, NE/LE/LX, Xbox, Switch, WebAssembly, Java classes, a.out and other OS formats are programs;
-    - RPMs and APK/IPA/JAR archives are packages.
+    - RPMs, APK/IPA/JAR archives and OLE compound files (Windows Installer packages, by root class or name) are packages.
   - **Images not in the store** are judged by name.
 - **Firmware view:**
   - **Scope:** firmware (the default), other binaries, or all. A URL without `kind` shows firmware; `kind=all` shows everything. The kind is also a facet, a column, a tree level and a matrix dimension, and the detail panel says why.

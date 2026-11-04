@@ -132,7 +132,11 @@ pub fn zrax_label() -> String {
 pub fn evaluate(data: &[u8], policy: &Policy) -> Verdict {
     let payload = match zrax::detect_payload(data, &ClassifierOptions::new()) {
         Ok(p) => p,
-        Err(ClassifierError::HeuristicInconclusive { .. } | ClassifierError::FileTooSmall { .. }) => {
+        Err(
+            ClassifierError::HeuristicInconclusive { .. }
+            | ClassifierError::HeuristicSparseCode { .. }
+            | ClassifierError::FileTooSmall { .. },
+        ) => {
             return Verdict::reject("unrecognized by zrax");
         }
         Err(e) => return Verdict::reject(format!("malformed: {e}")),

@@ -68,6 +68,12 @@ pub fn classify(path: Option<&Path>, format: &str, variant: &str, name: &str) ->
     if format == "zip" && PACKAGE_VARIANTS.contains(&variant) {
         return verdict(Kind::Package, variant);
     }
+    if format == "cfb" {
+        let ext = name.rsplit_once('.').map_or(String::new(), |(_, e)| e.to_ascii_lowercase());
+        let installer = matches!(ext.as_str(), "msi" | "msp" | "msm")
+            || path.and_then(|p| File::open(p).ok()).is_some_and(|file| cfb_installer(&Reader { file }));
+        return verdict(Kind::Package, if installer { "Windows Installer package" } else { "OLE compound file" });
+    }
     if PROGRAM_FORMATS.contains(&format) {
         return verdict(Kind::Program, format!("{format} executable"));
     }
@@ -88,6 +94,25 @@ pub fn classify(path: Option<&Path>, format: &str, variant: &str, name: &str) ->
         }
     }
     by_name(format, name)
+}
+
+/// Whether an OLE compound file's root entry carries a Windows Installer
+/// class: {000C1084-…} for packages and merge modules, {000C1086-…} for
+/// patches ([MS-CFB] 2.2 and 2.6.1).
+fn cfb_installer(r: &Reader) -> bool {
+    let header = r.read(0, 0x40);
+    if header.len() < 0x40 || header[..8] != [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1] {
+        return false;
+    }
+    let shift = u16::from_le_bytes([header[0x1e], header[0x1f]]);
+    let first = u32::from_le_bytes([header[0x30], header[0x31], header[0x32], header[0x33]]);
+    if !matches!(shift, 9 | 12) || first >= 0xffff_fffa {
+        return false;
+    }
+    let clsid = r.read(((u64::from(first) + 1) << shift) + 0x50, 16);
+    clsid.len() == 16
+        && matches!(clsid[..4], [0x84 | 0x86, 0x10, 0x0c, 0x00])
+        && clsid[4..] == [0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46]
 }
 
 fn sniff(path: &Path) -> Option<&'static str> {
@@ -556,6 +581,15 @@ mod tests {
         assert_eq!(classify(None, "rpm", "RPM package", "bash.rpm").kind, Kind::Package);
         assert_eq!(classify(None, "zip", "Android APK", "app.apk").kind, Kind::Package);
         assert_eq!(classify(None, "zip", "Nordic DFU package", "dfu.zip").kind, Kind::Firmware);
+        assert_eq!(classify(None, "cfb", "Compound file", "setup.msi").why, "Windows Installer package");
+        assert_eq!(classify(None, "cfb", "Compound file", "old.doc").why, "OLE compound file");
+        let mut cfb = vec![0u8; 1024];
+        cfb[..8].copy_from_slice(&[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+        cfb[0x1e] = 9; // 512-byte sectors; the directory starts at sector 0
+        cfb[512 + 0x50..512 + 0x60].copy_from_slice(&[0x84, 0x10, 0x0c, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46]);
+        let f = file(&cfb);
+        assert_eq!(classify(Some(f.path()), "cfb", "Compound file", "x").why, "Windows Installer package");
+        assert_eq!(classify(Some(f.path()), "cfb", "Compound file", "x").kind, Kind::Package);
         assert_eq!(classify(None, "dex", "", "classes.dex").kind, Kind::Program);
         assert_eq!(classify(None, "elf", "", "libfoo.so.1").kind, Kind::Library);
         assert_eq!(classify(None, "elf", "", "libfoo.so.mbn").kind, Kind::Firmware);

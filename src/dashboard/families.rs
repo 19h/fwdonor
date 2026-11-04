@@ -41,12 +41,12 @@ fn of(isa: &Isa) -> (&'static str, &'static str) {
         Dsp56k | Dsp96k | OakDsp | TriMedia => ("dsp", "Other DSP"),
         Tricore | C166 => ("infineon", "Infineon / Siemens"),
         Hcs12 | S12z | Hc11 | Hc05 | Hc08 | Hc16 | M6800 | M6809 => ("motorola8", "Motorola / NXP 8/16-bit"),
-        I8051 | Xa | Mcs96 => ("mcs", "Intel MCS-51 / MCS-96"),
-        Z80 | Z8 | Mcs6502 | W65816 | Spc700 => ("classic8", "Z80 / 6502 classics"),
+        I8051 | Mcs251 | Xa | Mcs96 => ("mcs", "Intel MCS-51 / MCS-251 / MCS-96"),
+        I8085 | Z80 | Z8 | Mcs6502 | W65816 | Spc700 => ("classic8", "8080 / Z80 / 6502 classics"),
         Avr | Avr32 | Pic => ("microchip", "Microchip / Atmel"),
         Stm8 | St7 | St9 | St20 => ("st", "STMicroelectronics"),
         Frv | Fr30 | Fr80 | F2mc16 => ("fujitsu", "Fujitsu"),
-        Tlcs900 | Mn10200 | Cr16 | C39 | Unsp | Kr1878 => ("mcu", "Other microcontrollers"),
+        Tlcs900 | Mn10200 | Mn10300 | Ipp | Cr16 | C39 | Unsp | Kr1878 => ("mcu", "Other microcontrollers"),
         AmdGpu | Cuda | VideoCore3 | VideoCore5 => ("gpu", "GPU / media processors"),
         Vax | Pdp11 | Alpha | Parisc | Ia64 | I860 | I960 => ("legacy", "Legacy workstation / mini"),
         Wasm | Jvm | Dalvik | Clr | Ebc | Bpf | Clemency => ("vm", "Bytecode / virtual machines"),
@@ -67,8 +67,8 @@ mod tests {
         assert_eq!(family("c166").0, "infineon");
         assert_eq!(family("nonsense"), OTHER);
         // Every ISA the raw-code model knows has a family of its own.
-        for raw in crate::analyze::raw_isas() {
-            assert_ne!(family(&raw.key), OTHER, "{} has no family", raw.key);
-        }
+        let missing: Vec<String> =
+            crate::analyze::raw_isas().iter().filter(|r| family(&r.key) == OTHER).map(|r| r.key.clone()).collect();
+        assert!(missing.is_empty(), "no family for {missing:?}");
     }
 }
