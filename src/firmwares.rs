@@ -180,14 +180,21 @@ pub struct Firmwares {
     records: Mutex<()>,
 }
 
+/// Prefix of the directories images are posted from (see `stage`).
+const POSTING: &str = ".posting-";
+
 impl Firmwares {
-    /// Create the store and drop temporary files a crash left behind.
+    /// Create the store and drop temporary files and posting copies a crash
+    /// left behind.
     pub fn open(dir: &Path, catalog: Arc<Catalog>) -> io::Result<Self> {
         std::fs::create_dir_all(dir)?;
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
-            if entry.file_name().to_string_lossy().ends_with(".tmp") {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".tmp") {
                 let _ = std::fs::remove_file(entry.path());
+            } else if name.starts_with(POSTING) {
+                let _ = std::fs::remove_dir_all(entry.path());
             }
         }
         Ok(Self { dir: dir.to_owned(), catalog, records: Mutex::new(()) })
@@ -227,6 +234,32 @@ impl Firmwares {
         write_durably(&self.record_path(&record.sha256), &serde_json::to_vec_pretty(record)?)?;
         self.catalog.put(record, &self.path(&record.sha256));
         Ok(())
+    }
+
+    fn posting_dir(&self, id: &str) -> PathBuf {
+        self.dir.join(format!("{POSTING}{id}"))
+    }
+
+    /// Blocking. The stored image under the name it is posted with
+    /// (Telegram names the document after the file): a hard link in
+    /// `.posting-<id>/`, inside this store's mount, or a copy where links
+    /// don't work. `unstage` removes it.
+    pub fn stage(&self, sha256: &str, id: &str, name: &str) -> io::Result<PathBuf> {
+        let dir = self.posting_dir(id);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir)?;
+        let target = dir.join(name);
+        let source = self.path(sha256);
+        let staged = std::fs::hard_link(&source, &target).or_else(|_| std::fs::copy(&source, &target).map(|_| ()));
+        if let Err(e) = staged {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+        Ok(target)
+    }
+
+    pub fn unstage(&self, id: &str) {
+        let _ = std::fs::remove_dir_all(self.posting_dir(id));
     }
 
     /// Blocking. Copy `file` in as `<sha256>` unless it is already there, and
@@ -390,6 +423,29 @@ mod tests {
             std::fs::read_dir(store_dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         names.sort();
         assert_eq!(names, [sha.clone(), format!("{sha}.json")], "no temporary files left");
+    }
+
+    #[test]
+    fn images_are_staged_under_their_name_for_posting() {
+        let store_dir = tempfile::tempdir().unwrap();
+        // A posting copy a crash left behind is removed on open.
+        std::fs::create_dir(store_dir.path().join(".posting-old")).unwrap();
+        std::fs::write(store_dir.path().join(".posting-old/x.bin"), b"x").unwrap();
+        let store = Firmwares::open(store_dir.path(), Arc::new(Catalog::new())).unwrap();
+        assert!(!store_dir.path().join(".posting-old").exists());
+
+        let sha = "ab".repeat(32);
+        std::fs::write(store.path(&sha), b"image").unwrap();
+        let staged = store.stage(&sha, "id1", "router 🛜.bin").unwrap();
+        assert_eq!(staged.file_name().unwrap(), "router 🛜.bin");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"image");
+        // Again (a retry): starts over cleanly.
+        assert_eq!(store.stage(&sha, "id1", "router 🛜.bin").unwrap(), staged);
+        store.unstage("id1");
+        assert!(!staged.parent().unwrap().exists());
+        assert_eq!(std::fs::read(store.path(&sha)).unwrap(), b"image", "the stored copy stays");
+        assert!(store.stage(&"cd".repeat(32), "id2", "gone.bin").is_err(), "nothing stored under that hash");
+        assert!(!store_dir.path().join(".posting-id2").exists());
     }
 
     fn summary(isa: &str, confidence: f64, zrax: &str) -> Summary {

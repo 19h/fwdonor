@@ -1,8 +1,9 @@
 // fwdonate against a dry-run server that keeps crashing and restarting:
 // every firmware file must end up posted, nothing else uploaded, and a second
-// run must find everything already in the collection. By default the client
-// has at most two files in the server's Telegram queue; with --no-wait it
-// hands over everything at once.
+// run must find everything already in the collection. The client's files
+// wait in the server's background lane, never in the web donations' queue,
+// and the client is done once they are verified: the server posts them
+// later, across its own crashes. --no-wait is still accepted (a no-op).
 //
 //   node tests/client.e2e.mjs <fwdonor binary> <fwdonate binary> <dir-with-files> [port]
 //
@@ -89,17 +90,36 @@ function runClient(args) {
   return { child, done };
 }
 
-// Largest Telegram queue seen while a client runs.
+// Largest queues seen while a client runs: web donations (`queued`) and the
+// background lane.
 async function watchQueue(done) {
-  let max = 0, finished = false;
+  const max = { web: 0, background: 0 };
+  let finished = false;
   done.then(() => { finished = true; });
   while (!finished) {
     try {
-      max = Math.max(max, (await (await fetch(`${base}/api/health`)).json()).queued);
+      const health = await (await fetch(`${base}/api/health`)).json();
+      max.web = Math.max(max.web, health.queued);
+      max.background = Math.max(max.background, health.background);
     } catch {}
     await sleep(100);
   }
   return max;
+}
+
+const ledger = () => readFileSync(path.join(work, 'runtime', 'posted.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l));
+
+// The client leaves before its files are posted: wait until every one is in
+// the ledger and nothing waits or posts any more.
+async function drained(expected, timeout = 400000) {
+  const until = Date.now() + timeout;
+  for (;;) {
+    const health = await (await fetch(`${base}/api/health`)).json();
+    const posted = new Set(ledger().map(e => e.sha256));
+    if (!health.queued && !health.background && !health.active && [...expected].every(h => posted.has(h))) return;
+    if (Date.now() > until) throw new Error(`posts did not drain: ${JSON.stringify(health)}, ${posted.size} posted`);
+    await sleep(250);
+  }
 }
 
 const admitted = () => (readFileSync(serverLog, 'utf8').match(/upload admitted/g) ?? []).length;
@@ -109,7 +129,8 @@ const admitted = () => (readFileSync(serverLog, 'utf8').match(/upload admitted/g
 function checkStore(expected) {
   const store = path.join(work, 'firmwares');
   const names = readdirSync(store);
-  assert.ok(!names.some(n => n.startsWith('.') || n.endsWith('.tmp')), 'no temporary files in the store');
+  assert.ok(!names.some(n => n.startsWith('.') || n.endsWith('.tmp')), 'no temporary files (or .posting-* dirs) in the store');
+  assert.deepEqual(readdirSync(path.join(work, 'runtime', 'background')), [], 'no background job left behind');
   const kept = names.filter(n => !n.endsWith('.json'));
   assert.deepEqual(kept.sort(), [...expected].sort(), 'the store holds exactly the donated firmware');
   for (const hash of kept) {
@@ -164,19 +185,29 @@ await sleep(2500);
 await start();
 
 const result = await first.done;
-const maxQueued = await firstQueue;
+const firstMax = await firstQueue;
 console.log(result.stdout.trim().split('\n').map(l => `  > ${l}`).join('\n'));
 assert.equal(result.code, 0, `first run exited with ${result.code}`);
 const lines = result.stdout.trim().split('\n');
 assert.equal(lines.filter(l => l.startsWith('donated')).length, firmware.size, 'every firmware file reported donated');
 assert.equal(lines.filter(l => l.startsWith('known')).length, 1, 'the copy is reported as a duplicate');
 assert.ok(!lines.some(l => /^(failed|rejected)/.test(l)), 'nothing failed or was rejected');
-assert.ok(maxQueued <= 2, `at most 2 files waited for Telegram at once (saw ${maxQueued})`);
+assert.equal(firstMax.web, 0, 'nothing from the client waited in the web queue');
+assert.ok(firstMax.background > 2, `the client's files waited in the background lane (saw at most ${firstMax.background})`);
+const waiting = (await (await fetch(`${base}/api/health`)).json()).background;
+console.log(`-- client done, ${waiting} file(s) still waiting in the background lane`);
 
-const ledger = readFileSync(path.join(work, 'runtime', 'posted.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l));
-assert.deepEqual([...new Set(ledger.map(e => e.sha256))].sort(), [...firmware].sort(), 'the ledger holds exactly the firmware');
-assert.ok(ledger.every(e => e.username === 'cli_e2e'), 'credited to the donor name');
-if (ledger.length !== firmware.size) console.log(`-- note: ${ledger.length - firmware.size} repost(s) after a crash (at-least-once delivery)`);
+// Crash once more with the backlog waiting: it resumes from its sidecars.
+if (waiting > 1) {
+  console.log('-- crash (SIGKILL) with the backlog waiting');
+  await stop('SIGKILL');
+  await start();
+}
+await drained(firmware);
+const posts = ledger();
+assert.deepEqual([...new Set(posts.map(e => e.sha256))].sort(), [...firmware].sort(), 'the ledger holds exactly the firmware');
+assert.ok(posts.every(e => e.username === 'cli_e2e'), 'credited to the donor name');
+if (posts.length !== firmware.size) console.log(`-- note: ${posts.length - firmware.size} repost(s) after a crash (at-least-once delivery)`);
 assert.equal(readdirSync(path.join(work, 'spool')).length, 0, 'spool is empty');
 checkStore(firmware);
 const uploads = admitted();
@@ -187,27 +218,22 @@ assert.ok(!second.stdout.split('\n').some(l => l.startsWith('donated')), 'second
 assert.equal(second.stdout.trim().split('\n').filter(l => l.startsWith('known')).length, firmware.size + 1);
 assert.equal(admitted(), uploads, 'second run uploads nothing');
 
-// --no-wait: everything goes to the server's queue as fast as it uploads.
+// --no-wait (from older builds' scripts) is still accepted and changes nothing.
 const more = [];
 for (let i = 0; i < 12; i++) more.push(put(`more/extra-${i}.elf`, Buffer.concat([elf, randomBytes(300 + i)]), true));
 const third = runClient(['--no-wait', path.join(donate, 'more')]);
-const thirdQueue = await watchQueue(third.done);
+const thirdMax = await watchQueue(third.done);
 const thirdResult = await third.done;
 assert.equal(thirdResult.code, 0);
 assert.equal(thirdResult.stdout.trim().split('\n').filter(l => l.startsWith('donated')).length, more.length);
-assert.ok(thirdQueue > 2, `--no-wait queued more than 2 at once (saw ${thirdQueue})`);
-// --no-wait leaves before its files are posted: let the queue drain.
-for (let i = 0; ; i++) {
-  const health = await (await fetch(`${base}/api/health`)).json();
-  if (!health.queued && !health.active) break;
-  assert.ok(i < 600, 'the queue drains');
-  await sleep(100);
-}
+assert.equal(thirdMax.web, 0, '--no-wait: nothing in the web queue either');
+await drained(firmware);
 checkStore(firmware);
-console.log(`-- largest Telegram queue: ${maxQueued} waiting for posts, ${thirdQueue} with --no-wait`);
+console.log(`-- largest background lane: ${firstMax.background} (first run), ${thirdMax.background} (--no-wait run)`);
 
-const resumed = [...readFileSync(serverLog, 'utf8').matchAll(/(\d+) job\(s\) resumed/g)].map(m => Number(m[1]));
-console.log(`-- first run: ${uploads} uploads admitted for ${firmware.size - more.length} files; jobs resumed per start: ${resumed.join(' ')}`);
+const starts = [...readFileSync(serverLog, 'utf8').matchAll(/(\d+) job\(s\) resumed, (\d+) from fwdonate/g)];
+assert.ok(starts.some(m => Number(m[2]) > 0), 'a start resumed background jobs');
+console.log(`-- first run: ${uploads} uploads admitted for ${firmware.size - more.length} files; jobs resumed per start (web/background): ${starts.map(m => `${m[1]}/${m[2]}`).join(' ')}`);
 await stop('SIGTERM');
 rmSync(work, { recursive: true });
 console.log('client e2e ok');

@@ -43,10 +43,10 @@ The page keeps waiting through server restarts and outages. Each request retries
 1. It takes files and directories, which are searched recursively. Symbolic links inside directories are followed only with `-L`.
 2. It classifies each file locally with the server's own zrax code and policy (`src/lib.rs`), so files the server would reject never leave the machine. A rejection would also count towards a ban.
 3. It skips files the collection already has, by their SHA-256 (`/api/known`).
-4. It solves the proof of work natively and uploads in chunks, two files at a time (the server's per-address limit).
-5. It follows each file until it is posted. Like the page, it starts another file only once one of its 2 is posted, so it never has more than 2 files in the Telegram queue and other donors' files don't wait behind a whole collection. `--no-wait` starts the next file as soon as the server has the previous one, which puts everything into the Telegram queue at once.
+4. It solves the proof of work natively and uploads in chunks, four files at a time (the server's per-address limit, `limits.per_ip_concurrent`). With the server's [import token](#import-token) it skips the proof of work and runs up to 32 at once.
+5. Its files go to the server's background lane (see [Post queue](#post-queue)). A file is done once the server has verified it and kept it in the store. The server posts it to the group later, whenever no donation from the page is waiting. A run takes as long as its uploads, not its posts, and never holds up donations from the page. `--no-wait` is still accepted and does nothing.
 
-Transient failures are retried forever, at most 20 s apart. These include the server restarting, limits and pauses. An upload the server lost is sent again. Ctrl-C cancels half-sent uploads; files already with the server still get posted.
+Transient failures are retried forever, at most 20 s apart. These include the server restarting, limits and pauses. An upload the server lost is sent again. Ctrl-C cancels half-sent uploads; files already with the server are still verified and posted.
 
 ```sh
 scripts/build.sh                      # vendors zrax at ZRAX_REV, builds everything
@@ -64,13 +64,48 @@ The exit status is:
 
 `FWDONOR_NAME` and `FWDONOR_SERVER` set the defaults for `-n` and `--server`.
 
-The client has to be built from the same `ZRAX_REV` as the server. After a zrax update, the server keeps accepting the previous build for 7 days, and fwdonate prints a note asking for a rebuild.
+The client has to be built from the same `ZRAX_REV` as the server. After a zrax update, the server keeps accepting the previous build for 7 days, and fwdonate prints a note asking for a rebuild. Builds from before the background lane don't ask for it: their files go to the web lane, and each run waits for its posts, until it's rebuilt.
+
+### Import token
+
+Importing a large collection goes faster with the server's import token, one more key next to the bulk admin and dashboard keys:
+
+```sh
+ssh root@int /data/fwdonor/target/release/fwdonor --config /data/fwdonor/fwdonor.toml import-token
+FWDONOR_TOKEN=… target/release/fwdonate -n your_name collection/   # or --token …
+```
+
+- **What it changes.** fwdonate sends it as `Authorization: Bearer …`. It then skips the proof of work and runs up to 32 uploads at once (`limits.import_concurrent`) instead of 4.
+  - `-j` defaults to what the server allows (`max_parallel` in `/api/policy`, which also says whether the token was accepted). A larger `-j` is cut down to it, with a note.
+  - Every upload with the token shares that one pool, whatever address it comes from, so the address keeps its own 4 for the page.
+  - The token's uploads have no hourly file or byte limits, and their rejections never lead to a ban.
+- **What it doesn't change.** Its files go to the background lane like any fwdonate run. The server verifies background files one at a time (one of the `limits.analysis_concurrency` slots stays free for the page). So the token speeds up the uploads, mostly large files that are slow through the proxy, not the verification.
+- **Room for the page.** Import uploads may fill the spool only up to 3/4 of `limits.spool_cap_bytes`. Past that they wait (`busy`, retried) while the page can still use the rest.
+- **A wrong token** is refused with 401 (`import_token`) rather than taken as no token, so a typo doesn't quietly fall back to 4. fwdonate stops with "the server doesn't accept this import token".
+- **The key.** It's created in `runtime/import.key` when the server first starts. To replace it, delete the file and restart: runs with the old token stop at their next upload.
+
+### Post queue
+
+The server posts one file at a time, at most one Telegram action every 3 s, from two lanes:
+
+- **Web:** files donated on the page. They are posted first, in the order they were verified. A file waits in the spool, and a restart resumes it from `spool/<id>.job.json`.
+- **Background:** files from fwdonate. They are posted only while no web file waits. Donor names take turns, one post each, and all anonymous runs share one turn, so one large collection doesn't hold up another donor's. A web file that arrives while a background file is being posted waits for that one post.
+
+A background file takes no spool space:
+- Once it's verified, it's kept in the store, and its job is a small sidecar, `runtime/background/<id>.json`. If the store can't keep it, the upload fails with a server storage error and fwdonate sends it again.
+- To post it, the server links the stored copy to `firmwares/.posting-<id>/<name>`, since Telegram names the document after the file. The caption comes from the store's current record, so a file that waited through a zrax update is posted with the new classification.
+- A failed post goes to the back of its donor's turn, for up to 3 attempts in all.
+- Older builds ignore `runtime/background/`, so a rollback keeps the backlog for the next upgrade.
+
+Post edits after a zrax update keep their share: one edit after every 4 posts, so about a fifth of the poster's turns while a backlog waits.
+
+A waiting background file is already in the dashboards, and `/api/known` reports it with `queued: true`, so a second upload of it is refused. The page's statistics count it once it's posted.
 
 ## Stored firmware
 
 Every image the server verifies is kept in `firmware_dir` (default `/data/fwdonor/firmwares`) as `<sha256>`, next to `<sha256>.json`.
 
-- **When it's copied:** right after verification and before posting, so an image stays even if posting fails. A copy error is logged, but the donation still goes ahead. The copy goes to a temporary name and is renamed into place, so `<sha256>` is always complete.
+- **When it's copied:** right after verification and before posting, so an image stays even if posting fails. For a donation from the page, a copy error is logged, but the donation still goes ahead. An fwdonate upload is posted from this copy, so it fails without one (see [Post queue](#post-queue)). The copy goes to a temporary name and is renamed into place, so `<sha256>` is always complete.
 - **Why copy, not move:** under the service's sandbox, `spool/`, `runtime/` and `firmwares/` are separate mounts, so a move or hard link between them fails.
 - **The record** holds:
   - `name`: the donor name the post credits;
@@ -211,6 +246,12 @@ A private, read-only view of everything donated: `/d/<dashboard key>` for the fi
     - The URL hash keeps the filters, sort, page, tree and open file.
     - Keys: `/` search, `j`/`k` move, Enter open, `[` `]` page or file, `x` select, `L` live, `?` help.
     - UTC or local time.
+- **Live updates.** Both dashboards follow the server over server-sent events (`…/live`). SSE rather than WebSockets because it is plain HTTP that pyx passes through without an upgrade. `src/dashboard/live.rs` is built so the cost doesn't grow with viewers:
+  - **One computation per interval.** One task computes each summary, and only while a page is watching: the public one at most every `live.interval_ms` (2 s), the private one every second. Every viewer gets the same serialized bytes. A stream only sends when something changed, plus a ping every 20 s. A slow connection skips frames rather than queueing them.
+  - **The table** is queried again when the catalog has moved on: every 10 s, less often as public viewers grow (`refresh` in the frame, aiming for `live.table_refreshes_per_sec` across all of them), with each page at its own place in that window. Query results are shared between identical requests: computed once while the catalog is unchanged (a public one for up to 5 s past a change) and sent gzipped when the browser takes it.
+  - **Caps.** `live.max_streams` (4096) in total and `live.streams_per_address` (8) per address. Past those, and in browsers without EventSource, the page polls `…/summary` every 10 s and tries the stream again after a minute or two. Public polls share the stream's frames; private ones are computed per request, so they show what an operator just did.
+  - **Reconnects spread out.** A stream starts with a random `retry:` (2–12 s) and ends after a random 10–20 minutes, and at shutdown. A tab that stays hidden for 30 s lets go of its stream and catches up when it's shown again. The page notices a stalled stream after 50 s.
+  - **Cost.** About 30 KiB of server memory per stream; a change reached 2000 local streams in about 0.35 s. Through pyx each viewer is also one client connection (10,000 at most in all, 100 per address) and one localhost connection to fwdonor. The private page shows how many are watching.
 - **Bulk view:**
   - links with their quota bars (used and reserved);
   - uploads in progress with a chunk map, hashing progress, speed, time left and a stalled flag;
@@ -221,7 +262,7 @@ A private, read-only view of everything donated: `/d/<dashboard key>` for the fi
 - **Public dashboard** at `/dashboard`, linked from the donation page. It is the same firmware view without a key and without anything operational:
   - **Left out:** bulk uploads, origin (uploaded or recovered), store status and backfill, donations in progress, server paths and disk space. Those dimensions can't be filtered, sorted or grouped by either.
   - **Rows:** they say only whether a file can be downloaded (`stored`).
-  - **API:** `/api/dashboard/…`. Exports are CSV, NDJSON (one at a time) and sha256sum, without rsync lists. Queries run at most four at a time, and the summary is cached for 2 s.
+  - **API:** `/api/dashboard/…`. Exports are CSV, NDJSON (one at a time) and sha256sum, without rsync lists. Queries run at most four at a time.
   - **Downloads** need a proof of work bound to the file. It is as much work as one solution `pow.download_extra_bits` (6) bits harder than an upload's (26 bits by default), split into 16 solutions of 22 bits.
     - That costs the same on average but takes a steady time; one big proof is pure luck.
     - The page finds the solutions on all cores at once (`web/pow-pool-worker.js`): about 0.3 s on a 16-core Mac, about 1.2 s on 4 cores.
@@ -252,10 +293,10 @@ Both lists and every limit live in `fwdonor.toml` (see `src/config.rs`), and `/a
 ssh root@int systemctl status fwdonor
 ssh root@int journalctl -u fwdonor -f
 ssh root@int touch /data/fwdonor/runtime/paused   # pause donations (rm to resume)
-curl https://fwdonor.zr.ax/api/health
+curl https://fwdonor.zr.ax/api/health          # queued: web files waiting; background, background_bytes: the fwdonate backlog
 ```
 
-**Deploys wait for a quiet moment.** `deploy.sh` builds while the old service keeps serving, with the new frontend staged in `dist.next/`. It then waits until `/api/health` reports no active uploads, an empty queue, and at least `IDLE_SECS` (default 10) without donation traffic. Only then does it swap `dist/` and restart. `MAX_WAIT=600 ./deploy.sh` restarts after 10 minutes regardless. The page copes with that, but a file in the middle of an upload has to be sent again. The restart itself takes about 0.1 s. The listener is bound before TDLib connects, so requests arriving in that window are queued rather than refused. For page-only changes, `FRONTEND_ONLY=1 ./deploy.sh` rebuilds and swaps `dist/` without restarting (the server reads it per request), so it needn't wait. Don't use it if the page needs anything new from the server.
+**Deploys wait for a quiet moment.** `deploy.sh` builds while the old service keeps serving, with the new frontend staged in `dist.next/`. It then waits until `/api/health` reports no active uploads, an empty web queue, and at least `IDLE_SECS` (default 10) without donation traffic. Only then does it swap `dist/` and restart. The fwdonate backlog doesn't hold a deploy back: it's on disk and resumes after the restart. On SIGTERM the poster finishes the post in progress (up to 25 s; `TimeoutStopSec=60s`) and starts no other, so a restart doesn't post a file twice. `MAX_WAIT=600 ./deploy.sh` restarts after 10 minutes regardless. The page copes with that, but a file in the middle of an upload has to be sent again. The restart itself takes about 0.1 s. The listener is bound before TDLib connects, so requests arriving in that window are queued rather than refused. For page-only changes, `FRONTEND_ONLY=1 ./deploy.sh` rebuilds and swaps `dist/` without restarting (the server reads it per request), so it needn't wait. Don't use it if the page needs anything new from the server.
 
 **Updating zrax:** put the new commit in `ZRAX_REV`, then run `./deploy.sh`. After the restart the store is classified again and posts are edited where their caption changes (see [Reclassification](#reclassification)). Pages that are already open keep the zrax they loaded. The server still accepts their uploads for 7 days (`src/revisions.rs`, history in `runtime/zrax-revs.json`) and re-verifies every file with its own zrax. Those pages show a notice suggesting a reload once their files are done. A server-side rejection of a file from such a page does not count towards a ban. After the 7 days, an old page is told to reload before donating more.
 
@@ -282,12 +323,18 @@ PLAYWRIGHT=…/playwright/index.mjs node tests/browser.e2e.mjs http://127.0.0.1:
 PLAYWRIGHT=…/playwright/index.mjs node tests/restart.e2e.mjs target/debug/fwdonor DIR expected.json
 # fwdonate against a dry-run server that crashes and restarts mid-run (DIR as above):
 node tests/client.e2e.mjs target/release/fwdonor target/release/fwdonate DIR
+# the two post queues: a web file posted ahead of fwdonate's backlog, donor turns, SIGTERM drain, SIGKILL resume:
+node tests/lanes.e2e.mjs target/release/fwdonor target/release/fwdonate
+# the import token: policy, no proof of work, its own pool of 32, 3/4 of the spool, fwdonate --token running 32 at once:
+node tests/import.e2e.mjs target/release/fwdonor target/release/fwdonate
 # bulk links: API end to end with crashes, a lost write, quota, duplicates, revoking (after scripts/build.sh):
 node tests/bulk.e2e.mjs target/release/fwdonor
 # bulk pages in a browser: issue a link, upload 600 MB, close the tab midway, resume:
 PLAYWRIGHT=…/playwright/index.mjs node tests/bulk.browser.e2e.mjs target/release/fwdonor [screenshot dir]
 # dashboard API: queries, facets, tree, details, downloads with Range, exports, bulk view, restart, privacy (DIR as above):
 node tests/dashboard.e2e.mjs target/release/fwdonor target/release/fwdonate DIR
+# live dashboards: streams, caps, shared queries, LOAD (2000) streams at once, shutdown; the pages too with PLAYWRIGHT:
+PLAYWRIGHT=…/playwright/index.mjs node tests/live.e2e.mjs target/release/fwdonor
 # the store classified again after a zrax update: outcomes, hidden files, post edits, a restart:
 node tests/reclassify.e2e.mjs target/release/fwdonor
 # dashboard pages in a browser (generates its own data):

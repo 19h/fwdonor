@@ -134,7 +134,12 @@ const ledger = readFileSync(path.join(work, 'runtime', 'posted.jsonl'), 'utf8').
 const donated = files.filter(f => expected[path.basename(f)] === 'donated').map(sha);
 assert.deepEqual([...new Set(ledger.map(e => e.sha256))].sort(), [...donated].sort(), 'ledger holds exactly the donated files');
 if (ledger.length !== donated.length) console.log(`-- note: ${ledger.length - donated.length} repost(s) after a crash (at-least-once delivery)`);
-const stats = await (await fetch(`${base}/api/stats`)).json();
+// /api/stats is cached for 2 s, so the last post may take that long to count.
+let stats;
+for (const until = Date.now() + 10000; ; await sleep(250)) {
+  stats = await (await fetch(`${base}/api/stats`)).json();
+  if (stats.files === donated.length || Date.now() > until) break;
+}
 assert.equal(stats.files, donated.length);
 await page.waitForFunction(n => document.getElementById('corpus-files').textContent === String(n), donated.length, { timeout: 30000 });
 assert.ok(stats.isas.some(i => i.files > 0 && i.isa === 'mips'), 'per-ISA counts include the MIPS uImages');

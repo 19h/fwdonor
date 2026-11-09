@@ -3,7 +3,7 @@
 // detail view with an entropy profile, hex and strings. All filtering happens
 // on the server (/api/dash/<key>/query); the view lives in the URL hash.
 import {
-  $, API, KEY, PUBLIC, api, esc, size, num, time, ago, copy, saveText, widths, setTabs, histogram, poll, banner, svg, rate, pointer,
+  $, API, KEY, PUBLIC, api, esc, size, num, time, ago, copy, saveText, widths, setTabs, histogram, follow, banner, svg, rate, pointer,
 } from './dash-common.js';
 
 const DIM_LABELS = {
@@ -219,6 +219,7 @@ async function runQuery() {
     if (pointer.down) window.addEventListener('pointerup', () => setTimeout(render), { once: true });
     else render();
     banner(null);
+    followTable();
   } catch (err) {
     if (err.name === 'AbortError') return;
     if (err.code === 'indexing') {
@@ -629,7 +630,7 @@ function renderTable() {
     const dir = i >= 0 ? (state.sort[i][1] ? 'desc' : 'asc') : '';
     return `<th class="${c.num ? 'num' : ''} ${c.sort ? 'sortable' : ''} ${dir}" ${c.sort ? `data-sort="${c.sort}"` : ''} aria-sort="${dir ? `${dir}ending` : 'none'}">${esc(c.label)}${dir ? ` <i>${dir === 'desc' ? '↓' : '↑'}${state.sort.length > 1 ? i + 1 : ''}</i>` : ''}</th>`;
   }).join('')}</tr>`;
-  $('files-rows').innerHTML = data.rows.map((r, i) => `<tr data-i="${i}" data-sha="${r.sha256}" class="${r.received_at > openedAt && openedAt ? 'new' : ''} ${i === cursor ? 'cursor' : ''} ${selected.has(r.sha256) ? 'picked' : ''} ${state.open === r.sha256 ? 'opened' : ''}">
+  $('files-rows').innerHTML = data.rows.map((r, i) => `<tr data-i="${i}" data-sha="${r.sha256}" class="${openedAt && r.received_at >= openedAt ? 'new' : ''} ${i === cursor ? 'cursor' : ''} ${selected.has(r.sha256) ? 'picked' : ''} ${state.open === r.sha256 ? 'opened' : ''}">
     <td class="sel"><input type="checkbox" ${selected.has(r.sha256) ? 'checked' : ''} aria-label="select"></td>
     ${cols.map(c => `<td class="${c.num ? 'num' : ''} c-${c.key}">${cell(c.key, r)}</td>`).join('')}</tr>`).join('')
     || `<tr><td colspan="${cols.length + 1}" class="muted empty-row">No file matches these filters.</td></tr>`;
@@ -961,7 +962,7 @@ function renderSummary(s) {
   $('s-donors-sub').textContent = `named donors${s.donors > s.named_donors ? ' + anonymous' : ''}`;
   $('s-isas').textContent = num(s.isas);
   $('s-isas-sub').textContent = `ISAs · ${num(s.formats)} formats · ${num(s.wanted.length)} wanted`;
-  $('updated').textContent = `updated ${time(s.now, { seconds: true }).slice(11)}`;
+  $('updated').textContent = `${streaming ? 'live · ' : ''}updated ${time(s.now, { seconds: true }).slice(11)}`;
   $('status').textContent = s.ready ? `${num(s.files)} images, ${size(s.bytes)}` : 'indexing…';
   $('wanted-count').textContent = num(s.wanted.length);
   $('wanted').innerHTML = s.wanted.map(w => `<li title="${esc(w.isa)}">${esc(w.name)}</li>`).join('');
@@ -987,11 +988,12 @@ function renderSummary(s) {
   $('s-backfill-sub').innerHTML = `${esc(bfText[1])}${s.unrecovered ? ` · <a href="#" data-status="unrecovered">${num(s.unrecovered)} failed</a>` : ''}`;
   renderReclassify(s);
   $('s-queue').textContent = num(s.queue.active);
-  $('s-queue-sub').textContent = `arriving · ${num(s.queue.queued)} queued to post${s.queue.paused ? ' · PAUSED' : ''}`;
+  const bg = s.queue.background ? ` · ${num(s.queue.background)} from fwdonate (${size(s.queue.background_bytes)})` : '';
+  $('s-queue-sub').textContent = `arriving · ${num(s.queue.queued)} queued to post${bg}${s.queue.paused ? ' · PAUSED' : ''}`;
   $('s-disk').textContent = size(s.disk.free);
   $('s-disk-sub').textContent = `free of ${size(s.disk.total)}`;
   $('bulk-badge').textContent = s.bulk.files ? num(s.bulk.files) : '';
-  $('status-zrax').textContent = `zrax ${s.zrax}${s.older_zrax ? ` · ${num(s.older_zrax)} classified by older versions` : ''} · ${num(s.ledger)} posts in the ledger`;
+  $('status-zrax').textContent = `zrax ${s.zrax}${s.older_zrax ? ` · ${num(s.older_zrax)} classified by older versions` : ''} · ${num(s.ledger)} posts in the ledger${s.live ? ` · ${num(s.live.streams)} watching live (${num(s.live.public)} public)` : ''}`;
 
   $('arriving-count').textContent = num(s.arriving.length);
   $('arriving-rows').innerHTML = s.arriving.map(a => `<tr class="st-${a.state}"><td><span class="pill">${a.state}</span></td>
@@ -1003,18 +1005,33 @@ function renderSummary(s) {
 
 }
 
-async function refreshSummary() {
-  try {
-    const s = await api('/summary');
-    banner(null);
-    renderSummary(s);
-    if (s.ready && !data && !queryBusy) runQuery();
-    // Live: follow changes, at most every 10 s, never while a query runs.
-    if (live && data && s.version !== data.version && !queryBusy && Date.now() - lastQueryAt > 9500) runQuery();
-  } catch (err) {
-    banner(err);
-    throw err;
-  }
+let streaming = false;
+function onSummary(s, how) {
+  streaming = how.streaming;
+  banner(null);
+  renderSummary(s);
+  if (s.ready && !data && !queryBusy) runQuery();
+  followTable();
+}
+
+// Live: the table follows changes, at most every `refresh` seconds (the
+// server's hint: 10, more when many people watch), at a slightly random
+// moment so that viewers don't all ask at once. Never while a query runs.
+let followTimer = null, followDue = 0;
+// Each page's own place in the refresh window, so viewers spread out.
+const followJitter = Math.random();
+function followTable() {
+  if (!live || !data || !summary || summary.version === data.version) return;
+  const every = Math.max(10, summary.refresh || 10) * 1000;
+  const due = lastQueryAt + every + followJitter * Math.min(5000, every / 4);
+  // A later frame may ask for sooner (fewer viewers now): move the timer up.
+  if (followTimer && due >= followDue) return;
+  clearTimeout(followTimer);
+  followDue = due;
+  followTimer = setTimeout(() => {
+    followTimer = null;
+    if (live && !document.hidden && !queryBusy && data && summary.version !== data.version) runQuery();
+  }, Math.max(0, due - Date.now()));
 }
 
 // ------------------------------------------------------------------ events
@@ -1071,7 +1088,7 @@ function wire() {
   $('live').addEventListener('click', () => {
     live = !live;
     $('live').classList.toggle('on', live);
-    if (live) refreshNow();
+    if (live) followTable();
   });
   $('limit').addEventListener('change', () => {
     state.limit = Number($('limit').value);
@@ -1257,8 +1274,7 @@ function keys(ev) {
   }
 }
 
-let refreshNow = () => {};
 state = parseHash();
 wire();
-refreshNow = poll(refreshSummary, 5000);
+follow(onSummary, banner);
 if (state.open) openFile(state.open, { focusRow: false });

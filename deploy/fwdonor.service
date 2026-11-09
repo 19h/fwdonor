@@ -15,7 +15,7 @@ Restart=on-failure
 # 78 = not logged in / bad config: retrying cannot help.
 RestartPreventExitStatus=78
 RestartSec=10s
-TimeoutStopSec=30s
+TimeoutStopSec=60s
 UMask=0077
 LimitNOFILE=65536
 # Up to two 512 MiB files are held in memory while zrax checks them.

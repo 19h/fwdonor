@@ -87,6 +87,13 @@ pub struct PolicyResponse {
     pub min_file_bytes: u64,
     pub paused: bool,
     pub policy: fwdonor::config::Policy,
+    /// Uploads at once the server allows this client (older servers don't
+    /// say).
+    #[serde(default)]
+    pub max_parallel: Option<usize>,
+    /// The server took our import token: more at once, no proof of work.
+    #[serde(default)]
+    pub import: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,14 +102,17 @@ pub struct Challenge {
     pub bits: u8,
 }
 
-/// A hash the server knows: posted (with when), or else being received or
-/// posted right now (`in_progress`).
+/// A hash the server knows: posted (with when), waiting for its post
+/// (`queued`), or else being received or posted right now (`in_progress`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Known {
     #[serde(default)]
     pub posted_at: Option<u64>,
     #[serde(default)]
     pub date: Option<String>,
+    /// Received and kept; waiting for its post (the background lane).
+    #[serde(default)]
+    pub queued: bool,
 }
 
 #[derive(Deserialize)]
@@ -116,9 +126,12 @@ pub struct InitRequest<'a> {
     pub size: u64,
     pub sha256: &'a str,
     pub username: &'a str,
+    /// The proof of work (none with an import token).
     pub token: &'a str,
     pub nonce: u64,
     pub zrax_rev: &'a str,
+    /// `background`: post it whenever no web donation is waiting.
+    pub lane: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,9 +148,6 @@ pub struct Status {
     pub state: String,
     #[serde(default)]
     pub reason: Option<String>,
-    /// Place in the Telegram queue (1 = next).
-    #[serde(default)]
-    pub position: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -152,9 +162,18 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CHUNK_TIMEOUT: Duration = Duration::from_secs(150);
 
 impl Api {
-    pub fn new(base: &str) -> anyhow::Result<Self> {
+    /// `import_token` goes with every request (`Authorization: Bearer`).
+    pub fn new(base: &str, import_token: Option<&str>) -> anyhow::Result<Self> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(token) = import_token {
+            let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| anyhow::anyhow!("the import token may only hold printable ASCII"))?;
+            value.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
         let http = Client::builder()
             .user_agent(concat!("fwdonate/", env!("CARGO_PKG_VERSION")))
+            .default_headers(headers)
             .connect_timeout(Duration::from_secs(10))
             .build()?;
         Ok(Self { http, base: base.trim_end_matches('/').to_string() })

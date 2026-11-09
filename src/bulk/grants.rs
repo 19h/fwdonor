@@ -71,7 +71,7 @@ pub fn load_or_create_key(path: &Path, what: &str, command: &str) -> Result<Stri
             let key = random_b64(32);
             super::write_durably(path, format!("{key}\n").as_bytes())
                 .with_context(|| format!("writing {}", path.display()))?;
-            tracing::info!("created the {what} key in {} (`fwdonor {command}` prints the page URL)", path.display());
+            tracing::info!("created the {what} key in {} (`fwdonor {command}` shows it)", path.display());
             Ok(key)
         }
         Err(e) => Err(e),

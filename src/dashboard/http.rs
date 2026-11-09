@@ -3,11 +3,12 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -15,15 +16,18 @@ use serde_json::{json, Value};
 use tower_http::services::ServeFile;
 
 use super::catalog::{csv_line, csv_row, ExportKind, Query as CatalogQuery, CSV_HEADER};
+use super::live::{private_frame, query_key, Cached, Scope};
 use super::Dashboard;
 use crate::analyze::zrax_label;
 use crate::error::ApiError;
-use crate::http::AppState;
+use crate::http::{client_ip, AppState};
+use crate::limits::ClientKey;
 use crate::uploads::unix_now;
 
 pub fn api_routes() -> Router<AppState> {
     Router::new()
         .route("/api/dash/{key}/summary", get(summary))
+        .route("/api/dash/{key}/live", get(live_stream))
         .route("/api/dash/{key}/query", get(query))
         .route("/api/dash/{key}/export", get(export))
         .route("/api/dash/{key}/files/{sha}", get(detail))
@@ -86,18 +90,39 @@ pub(super) fn indexing(d: &Dashboard) -> ApiError {
         .retry_after(2)
 }
 
+/// The summary for pages that poll: computed for this request, unlike the
+/// live stream's frames (src/dashboard/live.rs).
 async fn summary(State(state): State<AppState>, Path(key): Path<String>) -> Result<Json<Value>, ApiError> {
     let d = dash(&state, &key)?;
-    let now = unix_now();
     let catalog = d.catalog.clone();
-    let mut v = tokio::task::spawn_blocking(move || catalog.summary(now, &zrax_label())).await.map_err(ApiError::internal)?;
+    let full = tokio::task::spawn_blocking(move || catalog.summary(unix_now(), &zrax_label())).await.map_err(ApiError::internal)?;
+    Ok(Json(private_frame(&state, full)))
+}
+
+/// The summary as server-sent events (src/dashboard/live.rs).
+async fn live_stream(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let d = dash(&state, &key)?;
+    d.live.stream(Scope::Private, ClientKey::from_ip(client_ip(&state.config, peer, &headers)))
+}
+
+/// The private dashboard's summary: the catalog's, plus the server's state.
+pub(super) fn private_summary(state: &AppState, mut v: Value) -> Value {
+    let d = &state.dashboard;
     v["backfill"] = serde_json::to_value(&*d.backfill.lock().unwrap()).unwrap_or(Value::Null);
     let mut reclassify = serde_json::to_value(&*d.reclassify.lock().unwrap()).unwrap_or(Value::Null);
     reclassify["edits"] = serde_json::to_value(d.edits.counts()).unwrap_or(Value::Null);
     v["reclassify"] = reclassify;
     v["arriving"] = Value::Array(state.uploads.arriving());
+    let (background, background_bytes) = state.queue.background();
     v["queue"] = json!({
         "queued": state.queue.len(),
+        "background": background,
+        "background_bytes": background_bytes,
         "active": state.uploads.active(),
         "spooled_bytes": state.uploads.reserved_bytes(),
         "idle_secs": state.uploads.idle_secs(),
@@ -108,23 +133,31 @@ async fn summary(State(state): State<AppState>, Path(key): Path<String>) -> Resu
     v["ledger"] = json!(state.ledger.len());
     v["firmware_dir"] = json!(d.firmware_dir);
     v["bulk"] = state.bulk.brief();
-    v["now"] = json!(now);
-    Ok(Json(v))
+    v["now"] = json!(unix_now());
+    v
 }
 
+/// Shared between requests asking the same (src/dashboard/live.rs).
 async fn query(
     State(state): State<AppState>,
     Path(key): Path<String>,
+    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let d = dash(&state, &key)?;
     if !d.catalog.ready() {
         return Err(indexing(d));
     }
     let q = CatalogQuery::parse(&params).map_err(ApiError::bad_request)?;
     let catalog = d.catalog.clone();
-    let v = tokio::task::spawn_blocking(move || catalog.query(&q)).await.map_err(ApiError::internal)?;
-    Ok(Json(v))
+    let cached = d
+        .live
+        .private_queries
+        .get(query_key(&params), d.catalog.version(), async move {
+            tokio::task::spawn_blocking(move || Cached::encode(&catalog.query(&q))).await.map_err(ApiError::internal)
+        })
+        .await?;
+    Ok(cached.respond(&headers))
 }
 
 async fn detail(

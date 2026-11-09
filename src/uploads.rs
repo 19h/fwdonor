@@ -1,7 +1,7 @@
 //! Chunked upload sessions: admission, chunk writes, server-side
 //! verification, status, cancellation, and spool housekeeping.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,7 +21,7 @@ use crate::config::Config;
 use crate::firmwares::{Firmwares, Posted, Record};
 use crate::revisions::Revisions;
 use crate::error::ApiError;
-use crate::jobs::{Job, PostQueue};
+use crate::jobs::{Job, Lane, PostQueue, Queued};
 use crate::ledger::Ledger;
 use crate::limits::{ClientKey, Limiter};
 use crate::pow::PowGate;
@@ -63,6 +63,9 @@ struct Session {
     holds_slot: bool,
     /// Bytes counted against the spool cap until the file is deleted.
     reserved: u64,
+    lane: Lane,
+    /// A background job being posted from the store (not from the spool).
+    from_store: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,9 +75,14 @@ pub struct InitRequest {
     pub sha256: String,
     #[serde(default)]
     pub username: String,
+    /// The proof of work; uploads with the import token need none.
+    #[serde(default)]
     pub token: String,
+    #[serde(default)]
     pub nonce: u64,
     pub zrax_rev: String,
+    #[serde(default)]
+    pub lane: Lane,
 }
 
 #[derive(Debug, Serialize)]
@@ -96,6 +104,9 @@ pub struct StatusResponse {
     pub chunks: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<Summary>,
+    /// `background` for fwdonate's uploads; the page's have none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane: Option<Lane>,
 }
 
 pub struct Uploads {
@@ -111,6 +122,8 @@ pub struct Uploads {
     reserved: AtomicU64,
     /// Unix time of the last donation-related request (or of the start).
     activity: AtomicU64,
+    /// fwdonate's import token (`runtime/import.key`); None: no imports.
+    import_key: Option<String>,
 }
 
 /// Keep only the final path component, drop control characters and
@@ -218,7 +231,18 @@ impl Uploads {
             sessions: Mutex::new(HashMap::new()),
             reserved: AtomicU64::new(0),
             activity: AtomicU64::new(unix_now()),
+            import_key: None,
         }
+    }
+
+    pub fn with_import_key(mut self, key: String) -> Self {
+        self.import_key = Some(key);
+        self
+    }
+
+    /// Whether `presented` is the import token (compared in constant time).
+    pub fn is_import_key(&self, presented: &str) -> bool {
+        self.import_key.as_deref().is_some_and(|key| crate::bulk::grants::ct_eq(key, presented))
     }
 
     pub fn revisions(&self) -> &Revisions {
@@ -238,9 +262,12 @@ impl Uploads {
         chunk.min(size - index * chunk)
     }
 
+    /// Admit an upload. `ClientKey::IMPORT` (the import token, checked by
+    /// the caller) needs no proof of work.
     pub fn init(&self, req: InitRequest, key: ClientKey) -> Result<InitResponse, ApiError> {
         self.touch();
         let limits = &self.config.limits;
+        let import = key == ClientKey::IMPORT;
         if self.config.is_paused() {
             return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "paused", "donations are paused right now")
                 .retry_after(600));
@@ -250,8 +277,10 @@ impl Uploads {
         }
         let sha = parse_sha256(&req.sha256).ok_or_else(|| ApiError::bad_request("sha256 must be 64 hex digits"))?;
         let sha_hex = hex::encode(sha);
-        if let Err(e) = self.pow.redeem(&req.token, &sha, req.nonce) {
-            return Err(ApiError::new(StatusCode::FORBIDDEN, "pow", e.to_string()));
+        if !import {
+            if let Err(e) = self.pow.redeem(&req.token, &sha, req.nonce) {
+                return Err(ApiError::new(StatusCode::FORBIDDEN, "pow", e.to_string()));
+            }
         }
         if req.size < limits.min_file_bytes || req.size > limits.max_file_bytes {
             return Err(ApiError::new(
@@ -270,8 +299,13 @@ impl Uploads {
         if sessions.values().any(|s| s.sha256 == sha_hex && !s.state.is_final()) {
             return Err(ApiError::conflict("duplicate", "this image is already being donated"));
         }
+        if self.queue.contains_sha(&sha_hex) {
+            return Err(ApiError::conflict("duplicate", "already received, waiting for its post"));
+        }
         let reserved = self.reserved.load(Ordering::SeqCst);
-        if reserved + req.size > limits.spool_cap_bytes {
+        // An import leaves a quarter of the spool to donors on the page.
+        let cap = if import { limits.spool_cap_bytes - limits.spool_cap_bytes / 4 } else { limits.spool_cap_bytes };
+        if reserved + req.size > cap {
             return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "busy", "the server is busy, retrying shortly")
                 .retry_after(30));
         }
@@ -316,9 +350,11 @@ impl Uploads {
                 older_zrax: req.zrax_rev != self.revisions.current(),
                 holds_slot: true,
                 reserved: req.size,
+                lane: req.lane,
+                from_store: false,
             },
         );
-        tracing::info!(%id, %name, size = req.size, %username, "upload admitted");
+        tracing::info!(%id, %name, size = req.size, %username, lane = ?req.lane, import, "upload admitted");
         Ok(InitResponse { id, chunk_size: limits.chunk_bytes, chunks, name, username })
     }
 
@@ -373,9 +409,15 @@ impl Uploads {
         if !valid_id(id) {
             return Err(ApiError::not_found());
         }
-        let (file, sha, key, classifier_strikes) = {
+        let (file, sha, key, classifier_strikes, background) = {
             let mut sessions = self.sessions.lock().unwrap();
-            let session = sessions.get_mut(id).ok_or_else(ApiError::not_found)?;
+            let Some(session) = sessions.get_mut(id) else {
+                // Verified and handed to the background lane (a client retry).
+                if self.queue.has_background(id) {
+                    return Ok(());
+                }
+                return Err(ApiError::not_found());
+            };
             match session.state {
                 UploadState::Receiving => {}
                 // Repeated completion requests (client retries) are harmless.
@@ -386,7 +428,10 @@ impl Uploads {
                 return Err(ApiError::conflict("incomplete", format!("{missing} chunks missing")));
             }
             session.state = UploadState::Verifying;
-            if std::mem::take(&mut session.holds_slot) {
+            // A background upload keeps its slot until it is verified, so a
+            // run can't pile up files waiting for verification.
+            let background = session.lane == Lane::Background;
+            if !background && std::mem::take(&mut session.holds_slot) {
                 if let Some(key) = session.key {
                     self.limiter.release(key);
                 }
@@ -394,7 +439,7 @@ impl Uploads {
             // A page on an older zrax may disagree with our verdict without
             // doing anything wrong: that must not count towards a ban.
             let classifier_strikes = !session.older_zrax;
-            (session.file.clone(), session.sha256.clone(), session.key, classifier_strikes)
+            (session.file.clone(), session.sha256.clone(), session.key, classifier_strikes, background)
         };
 
         let this = Arc::clone(self);
@@ -404,7 +449,7 @@ impl Uploads {
             let actual = tokio::task::spawn_blocking(move || sha256_file(&path)).await;
             let (verdict, key) = match actual {
                 Ok(Ok(actual)) if actual == sha => {
-                    (this.analyzer.analyze_file(file).await, key.filter(|_| classifier_strikes))
+                    (this.analyzer.analyze_donation(file, background).await, key.filter(|_| classifier_strikes))
                 }
                 Ok(Ok(_)) => (Verdict::Rejected { reason: "checksum mismatch".into() }, key),
                 Ok(Err(e)) => (Verdict::Rejected { reason: format!("read failed: {e}") }, key),
@@ -418,10 +463,10 @@ impl Uploads {
     async fn finish_verification(&self, id: &str, verdict: Verdict, key: Option<ClientKey>) {
         match verdict {
             Verdict::Accepted(summary) => {
-                let job = {
+                let (job, lane) = {
                     let mut sessions = self.sessions.lock().unwrap();
                     let Some(session) = sessions.get_mut(id) else { return };
-                    Job {
+                    let job = Job {
                         id: id.to_string(),
                         name: session.name.clone(),
                         size: session.size,
@@ -433,16 +478,32 @@ impl Uploads {
                         },
                         file: session.file.clone(),
                         created_at: unix_now(),
-                    }
+                    };
+                    (job, session.lane)
                 };
                 // Keep a copy before posting, so the image stays even if
-                // posting fails. A storage error here must not cost the
-                // donation, so it is only logged.
+                // posting fails. For a web donation a storage error here must
+                // not cost the donation, so it is only logged.
                 let (store, file, record) = (self.firmwares.clone(), job.file.clone(), Record::for_upload(&job));
-                match tokio::task::spawn_blocking(move || store.keep(&file, &record)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => tracing::error!(%id, sha256 = %job.sha256, "keeping the firmware failed: {e}"),
-                    Err(e) => tracing::error!(%id, sha256 = %job.sha256, "keeping the firmware panicked: {e}"),
+                let kept = match tokio::task::spawn_blocking(move || store.keep(&file, &record)).await {
+                    Ok(Ok(())) => true,
+                    Ok(Err(e)) => {
+                        tracing::error!(%id, sha256 = %job.sha256, "keeping the firmware failed: {e}");
+                        false
+                    }
+                    Err(e) => {
+                        tracing::error!(%id, sha256 = %job.sha256, "keeping the firmware panicked: {e}");
+                        false
+                    }
+                };
+                // A background job is posted from the store's copy.
+                if lane == Lane::Background {
+                    if kept {
+                        self.hand_off(job).await;
+                    } else {
+                        self.finish(id, UploadState::Failed { reason: "server storage error".into() });
+                    }
+                    return;
                 }
                 if let Err(e) = job.write_sidecar(self.spool()) {
                     tracing::error!(%id, "sidecar write failed: {e:#}");
@@ -465,6 +526,98 @@ impl Uploads {
         }
     }
 
+    /// A verified background upload goes to the background lane. From here
+    /// on its file is the store's copy: the spool copy, the reservation, the
+    /// client's slot and the session go.
+    async fn hand_off(&self, job: Job) {
+        let id = job.id.clone();
+        let queued = Queued {
+            id: job.id.clone(),
+            sha256: job.sha256.clone(),
+            name: job.name.clone(),
+            size: job.size,
+            username: job.username.clone(),
+            created_at: job.created_at,
+            attempts: 0,
+        };
+        let (dir, spool, sidecar) = (self.config.background_dir(), self.spool().to_owned(), queued.clone());
+        let written = tokio::task::spawn_blocking(move || {
+            sidecar.write(&dir)?;
+            let _ = std::fs::remove_dir_all(Job::dir(&spool, &sidecar.id));
+            Ok::<_, std::io::Error>(())
+        })
+        .await;
+        if let Err(e) = written.map_err(std::io::Error::other).and_then(|r| r) {
+            tracing::error!(%id, "writing the background job failed: {e}");
+            self.finish(&id, UploadState::Failed { reason: "server storage error".into() });
+            return;
+        }
+        // In one step for `init`: the hash is always either in a session or
+        // in the lane.
+        let session = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let session = sessions.remove(&id);
+            if !self.queue.push_background(queued) {
+                tracing::warn!(%id, sha256 = %job.sha256, "already waiting in the background lane");
+                let _ = std::fs::remove_file(Queued::sidecar(&self.config.background_dir(), &id));
+            }
+            session
+        };
+        if let Some(session) = session {
+            self.reserved.fetch_sub(session.reserved, Ordering::SeqCst);
+            if session.holds_slot {
+                if let Some(key) = session.key {
+                    self.limiter.release(key);
+                }
+            }
+        }
+        tracing::info!(%id, name = %job.name, format = %job.summary.format, isa = ?job.summary.isa, "verified, queued in the background");
+    }
+
+    /// The poster starts on a background job (staged from the store).
+    pub fn begin_posting(&self, job: &Job) {
+        self.sessions.lock().unwrap().insert(
+            job.id.clone(),
+            Session {
+                key: None,
+                name: job.name.clone(),
+                size: job.size,
+                sha256: job.sha256.clone(),
+                username: job.username.clone(),
+                chunks: Vec::new(),
+                file: job.file.clone(),
+                last_activity: Instant::now(),
+                state: UploadState::Posting,
+                summary: Some(job.summary.clone()),
+                older_zrax: false,
+                holds_slot: false,
+                reserved: 0,
+                lane: Lane::Background,
+                from_store: true,
+            },
+        );
+    }
+
+    /// Blocking. A background post failed: back to the end of its donor's
+    /// turn, one attempt more.
+    pub fn requeue_background(&self, mut job: Queued) -> std::io::Result<()> {
+        job.attempts += 1;
+        job.write(&self.config.background_dir())?;
+        self.firmwares.unstage(&job.id);
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.remove(&job.id);
+        self.queue.push_background(job);
+        Ok(())
+    }
+
+    /// Blocking. A background job that won't be posted (it was posted
+    /// already, or the stored copy is gone) before it had a session.
+    pub fn drop_background(&self, id: &str) {
+        let _ = std::fs::remove_file(Queued::sidecar(&self.config.background_dir(), id));
+        self.firmwares.unstage(id);
+        self.queue.release(id);
+    }
+
     pub fn set_state(&self, id: &str, state: UploadState) {
         if let Some(session) = self.sessions.lock().unwrap().get_mut(id) {
             session.state = state;
@@ -474,7 +627,7 @@ impl Uploads {
 
     /// Enter a final state and delete everything spooled for the upload.
     pub fn finish(&self, id: &str, state: UploadState) {
-        let reserved = {
+        let (reserved, from_store) = {
             let mut sessions = self.sessions.lock().unwrap();
             let Some(session) = sessions.get_mut(id) else { return };
             session.state = state;
@@ -484,17 +637,34 @@ impl Uploads {
                     self.limiter.release(key);
                 }
             }
-            std::mem::take(&mut session.reserved)
+            (std::mem::take(&mut session.reserved), session.from_store)
         };
-        let _ = std::fs::remove_file(Job::sidecar(self.spool(), id));
-        let _ = std::fs::remove_dir_all(Job::dir(self.spool(), id));
+        if from_store {
+            let _ = std::fs::remove_file(Queued::sidecar(&self.config.background_dir(), id));
+            self.firmwares.unstage(id);
+        } else {
+            let _ = std::fs::remove_file(Job::sidecar(self.spool(), id));
+            let _ = std::fs::remove_dir_all(Job::dir(self.spool(), id));
+        }
         self.reserved.fetch_sub(reserved, Ordering::SeqCst);
     }
 
     pub fn status(&self, id: &str) -> Result<StatusResponse, ApiError> {
         self.touch();
         let sessions = self.sessions.lock().unwrap();
-        let session = sessions.get(id).ok_or_else(ApiError::not_found)?;
+        let Some(session) = sessions.get(id) else {
+            if self.queue.has_background(id) {
+                return Ok(StatusResponse {
+                    state: UploadState::Queued,
+                    position: None,
+                    received: 0,
+                    chunks: 0,
+                    summary: None,
+                    lane: Some(Lane::Background),
+                });
+            }
+            return Err(ApiError::not_found());
+        };
         let position = match session.state {
             UploadState::Queued => self.queue.position(id),
             _ => None,
@@ -505,6 +675,7 @@ impl Uploads {
             received: session.chunks.iter().filter(|c| **c).count(),
             chunks: session.chunks.len(),
             summary: session.summary.clone(),
+            lane: (session.lane == Lane::Background).then_some(Lane::Background),
         })
     }
 
@@ -576,7 +747,7 @@ impl Uploads {
         let count = keep.len();
         let mut jobs: Vec<Job> = keep.into_values().collect();
         jobs.sort_by_key(|j| j.created_at);
-        let mut posted_before_crash = HashMap::new();
+        let mut posted_before_crash = HashSet::new();
         let mut sessions = self.sessions.lock().unwrap();
         for job in jobs {
             if self.ledger.contains(&job.sha256) {
@@ -585,7 +756,7 @@ impl Uploads {
                 if let Err(e) = self.firmwares.keep(&job.file, &Record::for_upload(&job)) {
                     tracing::error!(id = %job.id, sha256 = %job.sha256, "keeping the firmware failed: {e}");
                 }
-                posted_before_crash.insert(job.sha256.clone(), ());
+                posted_before_crash.insert(job.sha256.clone());
                 let _ = std::fs::remove_file(Job::sidecar(&spool, &job.id));
                 let _ = std::fs::remove_dir_all(Job::dir(&spool, &job.id));
                 continue;
@@ -611,25 +782,78 @@ impl Uploads {
                     older_zrax: false,
                     holds_slot: false,
                     reserved: job.size,
+                    lane: Lane::Web,
+                    from_store: false,
                 },
             );
             self.queue.push(job);
         }
         drop(sessions);
-        if !posted_before_crash.is_empty() {
-            for entry in self.ledger.entries()?.into_iter().filter(|e| posted_before_crash.contains_key(&e.sha256)) {
-                let posted = Posted::new(self.config.telegram.chat_id, entry.message_id, entry.posted_at);
-                if let Err(e) = self.firmwares.mark_posted(&entry.sha256, posted) {
-                    tracing::error!(sha256 = %entry.sha256, "noting the post in the firmware record failed: {e}");
-                }
-            }
-        }
+        self.note_posts(&posted_before_crash)?;
         Ok(count)
     }
 
-    /// Whether an upload of this hash is in progress (not yet posted/failed).
+    /// Startup, after `recover`: the background lane from its sidecars.
+    pub fn recover_background(&self) -> anyhow::Result<usize> {
+        let dir = self.config.background_dir();
+        std::fs::create_dir_all(&dir)?;
+        let mut jobs = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            let Some(id) = name.strip_suffix(".json") else {
+                // A temporary file from a crash.
+                let _ = std::fs::remove_file(&path);
+                continue;
+            };
+            match std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Queued>(&b).ok()) {
+                Some(job) if job.id == id && valid_id(id) => jobs.push(job),
+                _ => {
+                    tracing::warn!("discarding unreadable background job {}", path.display());
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+        jobs.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        let (mut count, mut posted) = (0, HashSet::new());
+        for job in jobs {
+            let sidecar = Queued::sidecar(&dir, &job.id);
+            if self.ledger.contains(&job.sha256) {
+                // Posted just before a restart.
+                posted.insert(job.sha256.clone());
+                let _ = std::fs::remove_file(&sidecar);
+            } else if !self.firmwares.has(&job.sha256) {
+                tracing::warn!(id = %job.id, sha256 = %job.sha256, "the stored copy of a background job is gone; dropping it");
+                let _ = std::fs::remove_file(&sidecar);
+            } else if self.in_flight(&job.sha256) || !self.queue.push_background(job) {
+                let _ = std::fs::remove_file(&sidecar);
+            } else {
+                count += 1;
+            }
+        }
+        self.note_posts(&posted)?;
+        Ok(count)
+    }
+
+    /// Note in the records where these (posted before a crash) went.
+    fn note_posts(&self, shas: &HashSet<String>) -> anyhow::Result<()> {
+        if shas.is_empty() {
+            return Ok(());
+        }
+        for entry in self.ledger.entries()?.into_iter().filter(|e| shas.contains(&e.sha256)) {
+            let posted = Posted::new(self.config.telegram.chat_id, entry.message_id, entry.posted_at);
+            if let Err(e) = self.firmwares.mark_posted(&entry.sha256, posted) {
+                tracing::error!(sha256 = %entry.sha256, "noting the post in the firmware record failed: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether an upload of this hash is in progress (not yet posted/failed),
+    /// the background lane included.
     pub fn in_flight(&self, sha256: &str) -> bool {
-        self.sessions.lock().unwrap().values().any(|s| s.sha256 == sha256 && !s.state.is_final())
+        let sessions = self.sessions.lock().unwrap();
+        sessions.values().any(|s| s.sha256 == sha256 && !s.state.is_final()) || self.queue.contains_sha(sha256)
     }
 
     pub fn reserved_bytes(&self) -> u64 {
@@ -689,6 +913,7 @@ impl Uploads {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::Next;
 
     #[test]
     fn filenames() {
@@ -701,6 +926,195 @@ mod tests {
         let long = format!("{}.img", "é".repeat(100));
         let s = sanitize_filename(&long);
         assert!(s.len() <= 120 && s.ends_with(".img"), "{s}");
+    }
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        config: Arc<Config>,
+        ledger: Arc<Ledger>,
+        firmwares: Arc<Firmwares>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self::with(|_| {})
+        }
+
+        fn with(edit: impl FnOnce(&mut Config)) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = Config::default();
+            edit(&mut config);
+            config.runtime_dir = dir.path().join("runtime");
+            config.spool_dir = dir.path().join("spool");
+            config.firmware_dir = dir.path().join("firmwares");
+            for d in [&config.runtime_dir, &config.spool_dir] {
+                std::fs::create_dir_all(d).unwrap();
+            }
+            let ledger = Arc::new(Ledger::open(&config.ledger_path()).unwrap());
+            let catalog = Arc::new(crate::dashboard::catalog::Catalog::new());
+            let firmwares = Arc::new(Firmwares::open(&config.firmware_dir, catalog).unwrap());
+            Self { _dir: dir, config: Arc::new(config), ledger, firmwares }
+        }
+
+        /// A server as after a (re)start: its own queue, recovered.
+        fn uploads(&self) -> (Arc<Uploads>, Arc<PostQueue>) {
+            let queue = Arc::new(PostQueue::default());
+            let uploads = Arc::new(Uploads::new(
+                self.config.clone(),
+                Arc::new(PowGate::new(0, 60)),
+                Arc::new(Limiter::new(self.config.limits.clone())),
+                self.ledger.clone(),
+                Analyzer::new(1, Duration::from_secs(5), Arc::new(self.config.policy.clone())),
+                queue.clone(),
+                Arc::new(Revisions::open(&self.config.zrax_revs_path(), "rev", 0).unwrap()),
+                self.firmwares.clone(),
+            ));
+            uploads.recover().unwrap();
+            uploads.recover_background().unwrap();
+            (uploads, queue)
+        }
+    }
+
+    #[test]
+    fn imports_need_no_proof_of_work_and_leave_spool_for_the_page() {
+        let f = Fixture::with(|c| {
+            c.limits.import_concurrent = 2;
+            c.limits.spool_cap_bytes = 4000;
+        });
+        let (uploads, _) = f.uploads();
+        let uploads = Arc::into_inner(uploads).unwrap().with_import_key("k".repeat(43));
+        assert!(uploads.is_import_key(&"k".repeat(43)));
+        assert!(!uploads.is_import_key(&"k".repeat(42)) && !uploads.is_import_key(""));
+        let req = |n: u8, size: u64| InitRequest {
+            name: "fw.bin".into(),
+            size,
+            sha256: format!("{n:02x}").repeat(32),
+            username: "importer".into(),
+            token: String::new(),
+            nonce: 0,
+            zrax_rev: "rev".into(),
+            lane: Lane::Background,
+        };
+        let address = ClientKey::from_ip("10.0.0.9".parse().unwrap());
+        assert_eq!(uploads.init(req(1, 1000), address).unwrap_err().code, "pow", "an address needs the proof of work");
+        // An import may fill 3/4 of the spool (3000 of 4000 bytes)...
+        assert!(uploads.init(req(2, 1400), ClientKey::IMPORT).is_ok());
+        let busy = uploads.init(req(3, 1700), ClientKey::IMPORT).unwrap_err();
+        assert_eq!((busy.code, uploads.reserved_bytes()), ("busy", 1400), "the last quarter is the page's");
+        assert!(uploads.init(req(4, 1400), ClientKey::IMPORT).is_ok());
+        // ... in `import_concurrent` uploads at once.
+        assert_eq!(uploads.init(req(5, 100), ClientKey::IMPORT).unwrap_err().code, "limited");
+    }
+
+    fn summary() -> Summary {
+        serde_json::from_value(serde_json::json!({
+            "format": "elf", "format_name": "ELF", "bitwidth": 64, "endianness": "little", "confidence": 1.0,
+            "source": "container", "basis": "isa", "zrax": "x", "slices": [], "metadata": []
+        }))
+        .unwrap()
+    }
+
+    /// A background upload as `complete` leaves it: verifying, spooled,
+    /// holding its reservation.
+    fn verifying(uploads: &Uploads, id: &str, sha: &str, donor: &str) {
+        let dir = Job::dir(uploads.spool(), id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("{id}.bin"));
+        std::fs::write(&file, sha.as_bytes()).unwrap();
+        uploads.reserved.fetch_add(64, Ordering::SeqCst);
+        uploads.sessions.lock().unwrap().insert(
+            id.into(),
+            Session {
+                key: None,
+                name: format!("{id}.bin"),
+                size: 64,
+                sha256: sha.into(),
+                username: donor.into(),
+                chunks: vec![true],
+                file,
+                last_activity: Instant::now(),
+                state: UploadState::Verifying,
+                summary: None,
+                older_zrax: false,
+                holds_slot: false,
+                reserved: 64,
+                lane: Lane::Background,
+                from_store: false,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn background_uploads_wait_in_the_store_not_the_spool() {
+        let f = Fixture::new();
+        let (uploads, queue) = f.uploads();
+        let (a, b, c) = ("a".repeat(24), "b".repeat(24), "c".repeat(24));
+        let (sha_a, sha_b, sha_c) = ("1".repeat(64), "2".repeat(64), "3".repeat(64));
+        for (id, sha) in [(&a, &sha_a), (&b, &sha_b), (&c, &sha_c)] {
+            verifying(&uploads, id, sha, "cli_donor");
+            uploads.finish_verification(id, Verdict::Accepted(summary()), None).await;
+        }
+        assert_eq!(uploads.reserved_bytes(), 0, "no spool space held");
+        assert_eq!(std::fs::read_dir(uploads.spool()).unwrap().count(), 0, "spool is empty");
+        assert_eq!(queue.background(), (3, 192));
+        assert_eq!(queue.len(), 0, "nothing in the web lane");
+        assert!(uploads.in_flight(&sha_a) && f.firmwares.has(&sha_a));
+        let status = serde_json::to_value(uploads.status(&a).unwrap()).unwrap();
+        assert_eq!((status["state"].as_str(), status["lane"].as_str()), (Some("queued"), Some("background")));
+        assert!(uploads.complete(&a).is_ok(), "a retried completion is fine");
+        assert_eq!(uploads.active(), 0, "waiting jobs don't hold deploys");
+
+        // The poster takes `a` and posts it from the store.
+        let Some(Next::Background(job)) = queue.pop() else { panic!("expected a background job") };
+        let staged = f.firmwares.stage(&job.sha256, &job.id, &job.name).unwrap();
+        let posting = Job {
+            id: job.id.clone(),
+            name: job.name.clone(),
+            size: job.size,
+            sha256: job.sha256.clone(),
+            username: job.username.clone(),
+            summary: summary(),
+            file: staged.clone(),
+            created_at: job.created_at,
+        };
+        uploads.begin_posting(&posting);
+        queue.release(&job.id);
+        assert!(uploads.in_flight(&sha_a) && uploads.active() == 1, "posting counts as active");
+        uploads.finish(&job.id, UploadState::Posted);
+        assert!(!staged.exists() && f.firmwares.has(&sha_a), "the staged name goes, the stored copy stays");
+        assert!(!Queued::sidecar(&f.config.background_dir(), &a).exists());
+
+        // `b` was posted just before a crash (ledger written, sidecar not yet
+        // removed), `c` waits; a sidecar for a vanished image and debris.
+        f.ledger
+            .record(&crate::ledger::Entry {
+                sha256: sha_b.clone(),
+                name: "b.bin".into(),
+                size: 64,
+                username: "cli_donor".into(),
+                format: "elf".into(),
+                isa: None,
+                isas: vec![],
+                message_id: 9 << 20,
+                posted_at: 5,
+            })
+            .unwrap();
+        let gone = Queued { id: "d".repeat(24), sha256: "4".repeat(64), name: "d.bin".into(), size: 1, username: "x".into(), created_at: 0, attempts: 0 };
+        gone.write(&f.config.background_dir()).unwrap();
+        std::fs::write(f.config.background_dir().join("junk.json"), b"{").unwrap();
+        std::fs::write(f.config.background_dir().join("e.json.tmp"), b"half").unwrap();
+        drop((uploads, queue));
+
+        let (uploads, queue) = f.uploads();
+        assert_eq!(queue.background(), (1, 64), "only c is left to post");
+        let mut left: Vec<String> = std::fs::read_dir(f.config.background_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, [format!("{c}.json")]);
+        assert_eq!(f.firmwares.record(&sha_b).unwrap().unwrap().telegram.unwrap().message_id, 9 << 20, "b's record knows its post");
+        assert!(uploads.in_flight(&sha_c) && !uploads.in_flight(&sha_b));
     }
 
     #[test]

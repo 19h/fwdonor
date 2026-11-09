@@ -82,16 +82,17 @@ for (let i = 0; i < 50; i++) {
 assert.equal(status.state, 'rejected', JSON.stringify(status));
 console.log('server rejected garbage:', status.reason);
 
-// 6. Concurrency: a third simultaneous upload from one address is refused.
-const a = await admit(randomBytes(3000), { name: 'a.bin' });
-const b = await admit(randomBytes(3000), { name: 'b.bin' });
-const c = await admit(randomBytes(3000), { name: 'c.bin' });
-assert.equal(a.status, 201);
-assert.equal(b.status, 201);
-assert.equal(c.status, 429, `third concurrent: ${c.status} ${JSON.stringify(c.data)}`);
+// 6. Concurrency: a fifth simultaneous upload from one address is refused.
+const open = [];
+for (const n of ['a', 'b', 'c', 'e']) {
+  const r = await admit(randomBytes(3000), { name: `${n}.bin` });
+  assert.equal(r.status, 201, `upload ${open.length + 1} of 4: ${r.status} ${JSON.stringify(r.data)}`);
+  open.push(r.data.id);
+}
+const c = await admit(randomBytes(3000), { name: 'fifth.bin' });
+assert.equal(c.status, 429, `fifth concurrent: ${c.status} ${JSON.stringify(c.data)}`);
 assert.ok(Number(c.retryAfter) > 0, 'Retry-After on 429');
-await call('DELETE', `/api/uploads/${a.data.id}`);
-await call('DELETE', `/api/uploads/${b.data.id}`);
+for (const id of open) await call('DELETE', `/api/uploads/${id}`);
 
 // 7. Checksum mismatch (bytes differ from the declared hash) also rejects,
 // and three rejections ban the address.

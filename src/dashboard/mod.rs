@@ -9,6 +9,7 @@ pub mod families;
 pub mod http;
 pub mod inspect;
 pub mod kind;
+pub mod live;
 pub mod public;
 
 use std::path::PathBuf;
@@ -32,6 +33,7 @@ pub struct Dashboard {
     pub firmware_dir: PathBuf,
     pub inspector: inspect::Inspector,
     pub public: public::Public,
+    pub live: Arc<live::Live>,
 }
 
 impl Dashboard {
@@ -52,6 +54,7 @@ impl Dashboard {
             firmware_dir: config.firmware_dir.clone(),
             inspector: Default::default(),
             public: public::Public::new(config),
+            live: live::Live::new(&config.live),
         })
     }
 

@@ -240,6 +240,7 @@ async function flushKnown() {
 function markKnown(row, known) {
   row.dupKind = 'known';
   if (known.posted_at) setPhase(row, 'duplicate', `donated on ${known.date}`);
+  else if (known.queued) setPhase(row, 'duplicate', 'already received, waiting for its post');
   else setPhase(row, 'duplicate', 'someone is donating this right now');
 }
 
@@ -509,6 +510,11 @@ async function afterRestart(row) {
       return null;
     }
     if (!known) throw new Restart('the server restarted');
+    // Kept and waiting for its post (sent by someone else in the meantime).
+    if (known.queued) {
+      markKnown(row, known);
+      return null;
+    }
     setPhase(row, 'telegram', 'the server restarted · waiting for it to finish this file');
     await sleep(POLL_MS * 2);
   }

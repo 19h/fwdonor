@@ -3,6 +3,9 @@
 //! Clients are keyed by IPv4 address or IPv6 /64. The size an upload declares
 //! is charged when the upload is admitted and is never refunded, so rejected
 //! or abandoned uploads still count against the client.
+//!
+//! Uploads with the import token share one more client, `ClientKey::IMPORT`:
+//! `import_concurrent` at once, no hourly limits, never banned.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
@@ -17,6 +20,10 @@ const HOUR: Duration = Duration::from_secs(3600);
 pub struct ClientKey(u128);
 
 impl ClientKey {
+    /// Every upload made with the import token. No address maps to it: IPv4
+    /// keys stay below 2^32, IPv6 /64 keys end in 1.
+    pub const IMPORT: ClientKey = ClientKey(u128::MAX);
+
     pub fn from_ip(ip: IpAddr) -> Self {
         match ip {
             IpAddr::V4(v4) => ClientKey(u128::from(u32::from(v4))),
@@ -89,6 +96,13 @@ impl Limiter {
         let l = &self.limits;
         let mut state = self.state.lock().unwrap();
         let client = state.clients.entry(key).or_default();
+        if key == ClientKey::IMPORT {
+            if client.active >= l.import_concurrent {
+                return Err(Denied::Concurrent);
+            }
+            client.active += 1;
+            return Ok(());
+        }
         if let Some(until) = client.banned_until {
             if until > now {
                 return Err(Denied::Banned { retry_after: secs_until(until, now) });
@@ -123,6 +137,9 @@ impl Limiter {
 
     /// A file the browser claimed was firmware failed server verification.
     pub fn record_rejection(&self, key: ClientKey) -> bool {
+        if key == ClientKey::IMPORT {
+            return false;
+        }
         let now = Instant::now();
         let window = Duration::from_secs(self.limits.ban_secs);
         let mut state = self.state.lock().unwrap();
@@ -179,6 +196,26 @@ mod tests {
         assert!(!limiter.record_rejection(a));
         assert!(limiter.record_rejection(a));
         assert!(matches!(limiter.admit(a, 1), Err(Denied::Banned { .. })));
+    }
+
+    #[test]
+    fn the_import_token_has_its_own_pool_and_no_hourly_limits_or_bans() {
+        let limiter = Limiter::new(Limits { import_concurrent: 3, ban_after_rejections: 1, ..limits() });
+        let import = ClientKey::IMPORT;
+        for _ in 0..3 {
+            assert!(limiter.admit(import, u64::MAX / 4).is_ok(), "no byte or file limit");
+        }
+        assert_eq!(limiter.admit(import, 1), Err(Denied::Concurrent));
+        // Addresses keep their own slots.
+        let a = ClientKey::from_ip("10.0.0.3".parse().unwrap());
+        assert!(limiter.admit(a, 1).is_ok());
+        for _ in 0..5 {
+            limiter.release(import);
+            assert!(!limiter.record_rejection(import), "never banned");
+            assert!(limiter.admit(import, 1).is_ok(), "past the hourly file limit (3)");
+        }
+        assert_ne!(ClientKey::from_ip("255.255.255.255".parse().unwrap()), import);
+        assert_ne!(ClientKey::from_ip("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap()), import);
     }
 
     #[test]

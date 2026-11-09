@@ -4,7 +4,13 @@
 //! - zrax classifies every file locally, using the same library, revision and
 //!   policy lists the server applies, so the server has nothing to reject.
 //! - Files the collection already has are skipped by their SHA-256.
-//! - The rest go through the proof of work and a chunked upload, two at a time.
+//! - The rest go through the proof of work and a chunked upload, four at a time
+//!   (the server's limit per address). With the server's import token
+//!   (`--token`, from `fwdonor import-token`) there is no proof of work and up
+//!   to 32 go at once.
+//! - A file is done once the server has verified and kept it. The server
+//!   posts fwdonate's files to the group whenever no web donation is waiting
+//!   (its background lane), so a run never delays anyone else's donation.
 //!
 //! Failures that look temporary (the server restarting, a limit, a pause) are
 //! retried forever, at most 20 s apart. Uploads the server lost are sent again.
@@ -49,7 +55,9 @@ const SERVER_FAILURE_ATTEMPTS: u32 = 3;
     name = "fwdonate",
     version,
     about = "Donate firmware images to the zrax corpus (fwdonor.zr.ax)",
-    after_help = "Files zrax doesn't recognize as firmware never leave this machine. Exit status: 0 when \
+    after_help = "Files zrax doesn't recognize as firmware never leave this machine. A file is done once \
+                  the server has verified and kept it; the server posts it to the group later, after \
+                  donations from the page. Exit status: 0 when \
                   everything was donated, already known or skipped; 2 when some files failed or were \
                   rejected; 130 when interrupted."
 )]
@@ -67,14 +75,20 @@ struct Cli {
     #[arg(long, env = "FWDONOR_SERVER", default_value = "https://fwdonor.zr.ax", value_name = "URL")]
     server: String,
 
-    /// Files in flight at once (the server allows 2 uploads per address).
-    #[arg(short, long, default_value_t = 2, value_name = "N")]
-    jobs: usize,
+    /// Files in flight at once [default: as many as the server allows: 4 per
+    /// address, 32 with --token]
+    #[arg(short, long, value_name = "N")]
+    jobs: Option<usize>,
 
-    /// Start the next file as soon as the server has this one, without
-    /// waiting for it to be posted. Faster, but a large run then fills the
-    /// Telegram queue ahead of everyone else's donations.
-    #[arg(long)]
+    /// The server's import token (`fwdonor import-token` prints it): up to 32
+    /// files at once and no proof of work.
+    #[arg(long, env = "FWDONOR_TOKEN", hide_env_values = true, value_name = "TOKEN")]
+    token: Option<String>,
+
+    /// No longer needed: files never wait for their post. Accepted so
+    /// existing scripts keep working.
+    #[arg(long, hide = true)]
+    #[allow(dead_code)]
     no_wait: bool,
 
     /// Files classified at once (each is read into memory whole).
@@ -131,16 +145,33 @@ fn donor_name(raw: &str) -> Result<String> {
 
 async fn run(cli: Cli) -> Result<ExitCode> {
     let name = donor_name(&cli.name)?;
-    if cli.jobs == 0 || cli.check_jobs == 0 {
+    if cli.jobs == Some(0) || cli.check_jobs == 0 {
         bail!("--jobs and --check-jobs must be at least 1");
     }
-    let api = Api::new(&cli.server)?;
+    let token = cli.token.as_deref().map(str::trim).filter(|t| !t.is_empty());
+    let api = Api::new(&cli.server, token)?;
     let ours = zrax_rev();
 
     let notices = Notices::default();
-    let policy = persist(&notices, || api.policy(ours))
-        .await
-        .with_context(|| format!("{} doesn't look like a fwdonor server", cli.server))?;
+    let policy = match persist(&notices, || api.policy(ours)).await {
+        Ok(policy) => policy,
+        Err(e) if e.is("import_token") => bail!("{}: {}", cli.server, e.message),
+        Err(e) => return Err(e).with_context(|| format!("{} doesn't look like a fwdonor server", cli.server)),
+    };
+    if token.is_some() && !policy.import {
+        bail!("{} doesn't take import tokens (it runs an older fwdonor)", cli.server);
+    }
+    // Older servers don't say: they allow 4 per address.
+    let allowed = policy.max_parallel.unwrap_or(4).max(1);
+    let jobs = match cli.jobs {
+        Some(n) if n > allowed => {
+            let more = if policy.import { "" } else { "; the server's import token (--token) allows more" };
+            eprintln!("note: the server allows {allowed} uploads at once from this client{more}; using --jobs {allowed}");
+            allowed
+        }
+        Some(n) => n,
+        None => allowed,
+    };
     if policy.zrax_rev != ours {
         bail!(
             "the server runs zrax {} and no longer accepts this build (zrax {}): rebuild fwdonate from the \
@@ -150,14 +181,17 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         );
     }
     eprintln!(
-        "fwdonate {} · zrax {} · {} · donating as {name}{}",
+        "fwdonate {} · zrax {} · {} · donating as {name}{}{}",
         env!("CARGO_PKG_VERSION"),
         fwdonor::analyze::zrax_label(),
         cli.server,
+        if policy.import {
+            format!(" · import token, {jobs} at once")
+        } else {
+            String::new()
+        },
         if cli.dry_run {
             " · dry run"
-        } else if cli.no_wait {
-            " · not waiting for posts"
         } else {
             ""
         }
@@ -179,8 +213,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         name,
         dry_run: cli.dry_run,
         verbose: cli.verbose,
-        wait_posted: !cli.no_wait,
-        slots: Arc::new(Semaphore::new(cli.jobs)),
+        slots: Arc::new(Semaphore::new(jobs)),
         counts: Counts::default(),
         stop: AtomicBool::new(false),
         receiving: Mutex::new(HashSet::new()),
@@ -222,9 +255,16 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         parts.push(format!("{} not sent", load(&c.stopped)));
     }
     eprintln!("{} in {}: {}", if interrupted { "stopped" } else { "done" }, fmt_duration(ctx.started.elapsed()), parts.join(", "));
-    let waiting = load(&c.at_server);
-    if interrupted && waiting > 0 {
-        eprintln!("{waiting} upload(s) had already reached the server and will still be posted");
+    let verifying = load(&c.at_server);
+    if interrupted && verifying > 0 {
+        eprintln!("{verifying} upload(s) had already reached the server; it still verifies and posts them");
+    }
+    let waiting = load(&c.waiting_post);
+    if waiting > 0 {
+        eprintln!(
+            "the server posts {} to the group whenever no web donation is waiting",
+            if waiting == 1 { "this file".to_string() } else { format!("these {waiting} files") }
+        );
     }
 
     Ok(if interrupted {
@@ -254,8 +294,10 @@ struct Counts {
     /// Waiting for an upload slot or uploading.
     to_upload: AtomicU64,
     uploading: AtomicU64,
-    /// Completed uploads the server is verifying or posting.
+    /// Completed uploads the server is verifying.
     at_server: AtomicU64,
+    /// Donated files that wait for their post on the server.
+    waiting_post: AtomicU64,
 }
 
 struct Ctx {
@@ -264,11 +306,8 @@ struct Ctx {
     name: String,
     dry_run: bool,
     verbose: bool,
-    /// Keep a file's slot until it is posted (as the page does), so this run
-    /// has at most `--jobs` files in the Telegram queue at a time.
-    wait_posted: bool,
     /// Files in flight: a slot is held from the proof of work until the upload
-    /// is complete, or until the file is posted with `wait_posted`.
+    /// is verified (the server holds the address's slot that long too).
     slots: Arc<Semaphore>,
     counts: Counts,
     /// Set on Ctrl-C or when the server stops accepting this client.
@@ -448,7 +487,7 @@ struct Candidate {
 }
 
 /// walk → classify (check_jobs at once) → look up hashes in batches →
-/// upload (`--jobs` at once) → wait until posted.
+/// upload (`--jobs` at once) → wait until verified.
 async fn pipeline(ctx: Arc<Ctx>, paths: Vec<PathBuf>, follow_links: bool, check_jobs: usize) -> Result<()> {
     let (path_tx, mut path_rx) = mpsc::channel::<PathBuf>(1024);
     let (cand_tx, mut cand_rx) = mpsc::channel::<Candidate>(1024);
@@ -532,6 +571,9 @@ async fn pipeline(ctx: Arc<Ctx>, paths: Vec<PathBuf>, follow_links: bool, check_
                         Some(k) if k.posted_at.is_some() => {
                             let when = k.date.as_deref().unwrap_or("earlier");
                             ctx.finish(&c.path, c.size, None, Outcome::Duplicate(format!("already in the collection (donated {when})")));
+                        }
+                        Some(k) if k.queued => {
+                            ctx.finish(&c.path, c.size, None, Outcome::Duplicate("received already, waiting for its post".into()))
                         }
                         Some(_) => ctx.finish(&c.path, c.size, None, Outcome::Duplicate("being donated right now".into())),
                         None if ctx.dry_run => {
@@ -710,20 +752,14 @@ async fn upload_once(ctx: &Ctx, c: &Candidate, slot: OwnedSemaphorePermit) -> St
         complete(ctx, c, &session.id).await?
     };
     drop(uploading);
-    // The server gives this address its upload slot back once the file is
-    // complete. Without waiting, the next file starts now and this one waits
-    // for Telegram on its own.
-    let _slot = if ctx.wait_posted {
-        Some(slot)
-    } else {
-        drop(slot);
-        None
-    };
-    let _at_server = Gauge::new(&ctx.counts.at_server);
-    await_post(ctx, c, &session.id, status).await
+    // The slot is kept until the file is verified (the server keeps the
+    // address's slot that long, too). Its post doesn't hold anything up.
+    let _slot = slot;
+    let _verifying = Gauge::new(&ctx.counts.at_server);
+    await_verified(ctx, c, &session.id, status).await
 }
 
-/// Proof of work and upload admission.
+/// Proof of work (unless with the import token) and upload admission.
 async fn admit(ctx: &Ctx, c: &Candidate) -> Step<InitResponse> {
     let name = c.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "firmware.bin".into());
     let mut attempt = 0;
@@ -732,23 +768,29 @@ async fn admit(ctx: &Ctx, c: &Candidate) -> Step<InitResponse> {
         if ctx.stopped() {
             return Err(Flow::Done(Outcome::Stopped));
         }
-        let challenge = ctx.persist(|| ctx.api.challenge()).await.map_err(|e| Flow::Done(Outcome::Failed(e.to_string())))?;
-        let nonce = {
+        // The import token stands in for the proof of work.
+        let (token, nonce) = if ctx.policy.import {
+            (String::new(), 0)
+        } else {
+            let challenge =
+                ctx.persist(|| ctx.api.challenge()).await.map_err(|e| Flow::Done(Outcome::Failed(e.to_string())))?;
             let (token, sha) = (challenge.token.clone(), c.sha);
-            tokio::task::spawn_blocking(move || solve(&token, &sha, challenge.bits))
+            let nonce = tokio::task::spawn_blocking(move || solve(&token, &sha, challenge.bits))
                 .await
                 .map_err(|e| e.to_string())
                 .and_then(|r| r.map_err(|e| format!("{e:#}")))
-                .map_err(|e| Flow::Done(Outcome::Failed(format!("proof of work failed: {e}"))))?
+                .map_err(|e| Flow::Done(Outcome::Failed(format!("proof of work failed: {e}"))))?;
+            (challenge.token, nonce)
         };
         let req = InitRequest {
             name: &name,
             size: c.size,
             sha256: &c.sha256,
             username: &ctx.name,
-            token: &challenge.token,
+            token: &token,
             nonce,
             zrax_rev: zrax_rev(),
+            lane: "background",
         };
         match ctx.api.init(&req).await {
             Ok(session) => {
@@ -758,6 +800,10 @@ async fn admit(ctx: &Ctx, c: &Candidate) -> Step<InitResponse> {
             Err(e) if e.is("duplicate") => return Err(Flow::Done(Outcome::Duplicate(e.message))),
             Err(e) if e.is("stale_client") => {
                 ctx.halt("the server no longer accepts this zrax revision; rebuild fwdonate from the current fwdonor source");
+                return Err(Flow::Done(Outcome::Stopped));
+            }
+            Err(e) if e.is("import_token") => {
+                ctx.halt(&format!("{} (was it replaced?)", e.message));
                 return Err(Flow::Done(Outcome::Stopped));
             }
             Err(e) if e.banned() => {
@@ -847,17 +893,24 @@ async fn complete(ctx: &Ctx, c: &Candidate, id: &str) -> Step<Status> {
     }
 }
 
-/// Follow verification and posting until the file is in the group.
-async fn await_post(ctx: &Ctx, c: &Candidate, id: &str, mut status: Status) -> Step<Outcome> {
+/// Follow verification until the server has kept the file. It is posted
+/// later, whenever no web donation is waiting.
+async fn await_verified(ctx: &Ctx, c: &Candidate, id: &str, mut status: Status) -> Step<Outcome> {
+    let mut wait = FIRST_POLL;
     loop {
         match status.state.as_str() {
+            "queued" | "posting" => {
+                ctx.counts.waiting_post.fetch_add(1, Ordering::SeqCst);
+                return Ok(Outcome::Donated);
+            }
             "posted" => return Ok(Outcome::Donated),
             "rejected" => return Ok(Outcome::Rejected(status.reason.unwrap_or_default())),
             "failed" => return Err(Flow::ServerFailed(status.reason.unwrap_or_default())),
             "receiving" => return Err(Flow::Restart("the server restarted".into())),
             _ => {}
         }
-        tokio::time::sleep(poll_interval(status.position)).await;
+        tokio::time::sleep(wait).await;
+        wait = next_poll(wait);
         let mut attempt = 0;
         status = loop {
             match ctx.api.status(id).await {
@@ -873,10 +926,11 @@ async fn await_post(ctx: &Ctx, c: &Candidate, id: &str, mut status: Status) -> S
     }
 }
 
-/// Every 2 s near the front of the Telegram queue, up to 30 s further back
-/// (the group takes a post every few seconds).
-fn poll_interval(position: Option<usize>) -> Duration {
-    Duration::from_secs(position.unwrap_or(0).clamp(2, 30) as u64)
+/// Verification takes about half a second: ask soon, then less often.
+const FIRST_POLL: Duration = Duration::from_millis(250);
+
+fn next_poll(wait: Duration) -> Duration {
+    (wait * 3 / 2).min(Duration::from_secs(2))
 }
 
 /// The server no longer knows the upload: did it post the file before it
@@ -888,6 +942,11 @@ async fn after_restart(ctx: &Ctx, c: &Candidate) -> Flow {
         match ctx.persist(|| ctx.api.known(&one)).await {
             Ok(known) => match known.get(&c.sha256) {
                 Some(k) if k.posted_at.is_some() => return Flow::Done(Outcome::Donated),
+                // Verified and kept before the restart: waiting for its post.
+                Some(k) if k.queued => {
+                    ctx.counts.waiting_post.fetch_add(1, Ordering::SeqCst);
+                    return Flow::Done(Outcome::Donated);
+                }
                 Some(_) => {
                     tokio::time::sleep(backoff(attempt, None)).await;
                     attempt += 1;
@@ -913,7 +972,7 @@ async fn progress(ctx: Arc<Ctx>) {
         } else {
             let (uploading, at_server) = (load(&c.uploading), load(&c.at_server));
             line += &format!(
-                ", {} waiting to upload, {uploading} uploading, {at_server} with the server, {} donated",
+                ", {} waiting to upload, {uploading} uploading, {at_server} being verified, {} donated",
                 load(&c.to_upload).saturating_sub(uploading + at_server),
                 load(&c.donated)
             );
@@ -987,11 +1046,9 @@ mod tests {
     }
 
     #[test]
-    fn polls_slower_further_back_in_the_queue() {
-        assert_eq!(poll_interval(None), Duration::from_secs(2));
-        assert_eq!(poll_interval(Some(1)), Duration::from_secs(2));
-        assert_eq!(poll_interval(Some(12)), Duration::from_secs(12));
-        assert_eq!(poll_interval(Some(400)), Duration::from_secs(30));
+    fn polls_soon_then_less_often() {
+        let waits: Vec<u128> = std::iter::successors(Some(FIRST_POLL), |w| Some(next_poll(*w))).take(7).map(|w| w.as_millis()).collect();
+        assert_eq!(waits, [250, 375, 562, 843, 1265, 1898, 2000]);
     }
 
     #[test]

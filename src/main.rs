@@ -52,6 +52,11 @@ enum Command {
     /// Print the URL of the firmware dashboard (its own key, also created
     /// when the server first starts).
     DashboardUrl,
+    /// Print fwdonate's import token (`fwdonate --token`): up to
+    /// limits.import_concurrent uploads at once, no proof of work. Created
+    /// when the server first starts; delete runtime/import.key and restart
+    /// for a new one.
+    ImportToken,
     /// Print the donation verdict zrax gives each file.
     Check {
         /// Emit one JSON object per line instead of a table.
@@ -66,6 +71,9 @@ extern "C" {
 }
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+/// How long a shutdown waits for the post being sent (systemd allows 60 s
+/// in all, and closing TDLib takes up to 20 s).
+const POST_GRACE: Duration = Duration::from_secs(25);
 
 /// Set once a graceful shutdown starts, so closing TDLib isn't mistaken for
 /// a lost session.
@@ -115,6 +123,12 @@ fn run() -> Result<()> {
             let key = bulk::grants::read_key(&config.dashboard_key_path())
                 .context("start the server once first (`fwdonor serve` creates the key)")?;
             println!("{}/d/{key}", config.public_url.trim_end_matches('/'));
+            Ok(())
+        }
+        Command::ImportToken => {
+            let key = bulk::grants::read_key(&config.import_key_path())
+                .context("start the server once first (`fwdonor serve` creates the token)")?;
+            println!("{key}");
             Ok(())
         }
         Command::Serve => {
@@ -178,20 +192,25 @@ async fn serve(config: Config) -> Result<()> {
             .with_context(|| format!("opening {}", config.firmware_dir.display()))?,
     );
     let queue = Arc::new(jobs::PostQueue::default());
-    let uploads = Arc::new(uploads::Uploads::new(
-        config.clone(),
-        pow.clone(),
-        limiter.clone(),
-        ledger.clone(),
-        analyzer.clone(),
-        queue.clone(),
-        revisions,
-        firmwares.clone(),
-    ));
+    let import_key = bulk::grants::load_or_create_key(&config.import_key_path(), "import", "import-token")?;
+    let uploads = Arc::new(
+        uploads::Uploads::new(
+            config.clone(),
+            pow.clone(),
+            limiter.clone(),
+            ledger.clone(),
+            analyzer.clone(),
+            queue.clone(),
+            revisions,
+            firmwares.clone(),
+        )
+        .with_import_key(import_key),
+    );
     let recovered = uploads.recover()?;
+    let background = uploads.recover_background()?;
     let bulk = bulk::Bulk::open(config.clone())?;
     tracing::info!(
-        "zrax {}, {} posted so far, {recovered} job(s) resumed",
+        "zrax {}, {} posted so far, {recovered} job(s) resumed, {background} from fwdonate waiting in the background",
         analyze::zrax_label(),
         ledger.len()
     );
@@ -242,6 +261,7 @@ async fn serve(config: Config) -> Result<()> {
 
     let telegram = client.clone();
     let edits = Arc::new(telegram::poster::EditQueue::default());
+    let (stop_posting, stop) = tokio::sync::watch::channel(false);
     let poster = telegram::poster::Poster {
         client,
         chat_id,
@@ -250,8 +270,9 @@ async fn serve(config: Config) -> Result<()> {
         ledger: ledger.clone(),
         firmwares: firmwares.clone(),
         edits: edits.clone(),
+        stop,
     };
-    tokio::spawn(poster.run());
+    let mut posting = tokio::spawn(poster.run());
 
     // After a zrax update, classify the store again (once the index is built).
     let reclassify_status = reclassify::status("off");
@@ -302,7 +323,8 @@ async fn serve(config: Config) -> Result<()> {
     }
 
     let dashboard = Arc::new(dashboard::Dashboard::open(&config, catalog, backfill_status, reclassify_status, edits)?);
-    let app = http::router(http::AppState {
+    let live = dashboard.live.clone();
+    let state = http::AppState {
         config: config.clone(),
         pow,
         uploads,
@@ -310,7 +332,10 @@ async fn serve(config: Config) -> Result<()> {
         ledger,
         bulk: bulk.clone(),
         dashboard,
-    });
+    };
+    // The dashboards' live summary (src/dashboard/live.rs).
+    tokio::spawn(dashboard::live::run(state.clone()));
+    let app = http::router(state);
     tracing::info!("listening on http://{}", config.bind);
     let stop = Arc::new(tokio::sync::Notify::new());
     let server = {
@@ -325,6 +350,11 @@ async fn serve(config: Config) -> Result<()> {
         result = &mut server => result?,
         _ = async { tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} } } => {
             tracing::info!("shutting down");
+            // The poster finishes the post it is sending and takes no more.
+            let _ = stop_posting.send(true);
+            // Live dashboard streams would hold the shutdown open: end them
+            // (the pages reconnect to the new process).
+            live.close();
             stop.notify_one();
             // The files being classified didn't cause this exit.
             inflight.close();
@@ -332,6 +362,10 @@ async fn serve(config: Config) -> Result<()> {
             // those files again), so don't hold the restart for slow chunks.
             if tokio::time::timeout(SHUTDOWN_GRACE, &mut server).await.is_err() {
                 tracing::warn!("requests still open after {SHUTDOWN_GRACE:?}; exiting anyway");
+            }
+            // Cutting a post off could post it twice after the restart.
+            if tokio::time::timeout(POST_GRACE, &mut posting).await.is_err() {
+                tracing::warn!("still posting after {POST_GRACE:?}; exiting anyway (it may be posted twice)");
             }
         }
     }

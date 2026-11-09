@@ -216,13 +216,21 @@ fn summarize(p: &DetectionPayload, format: String, basis: &str) -> Summary {
 #[derive(Clone)]
 pub struct Analyzer {
     permits: Arc<Semaphore>,
+    /// Background uploads (fwdonate) take one of these first, so they never
+    /// hold every permit and a web donation waits behind at most one of them.
+    background: Arc<Semaphore>,
     timeout: Duration,
     policy: Arc<Policy>,
 }
 
 impl Analyzer {
     pub fn new(concurrency: usize, timeout: Duration, policy: Arc<Policy>) -> Self {
-        Self { permits: Arc::new(Semaphore::new(concurrency)), timeout, policy }
+        Self {
+            permits: Arc::new(Semaphore::new(concurrency)),
+            background: Arc::new(Semaphore::new(concurrency.saturating_sub(1).max(1))),
+            timeout,
+            policy,
+        }
     }
 
     /// Parse the 6.2 MB code model once so the first donor doesn't pay for it.
@@ -233,22 +241,40 @@ impl Analyzer {
 
     /// A donation's verdict: zrax not coming to an answer is a rejection.
     pub async fn analyze_file(&self, path: PathBuf) -> Verdict {
-        match self.analyze_file_outcome(path).await {
+        self.analyze_donation(path, false).await
+    }
+
+    /// The same for a donation; `background` ones (fwdonate) leave room for
+    /// web donations.
+    pub async fn analyze_donation(&self, path: PathBuf, background: bool) -> Verdict {
+        match self.analyze(path, background).await {
             Outcome::Verdict(v) => v,
             Outcome::Failed(reason) => Verdict::reject(reason),
         }
     }
 
     pub async fn analyze_file_outcome(&self, path: PathBuf) -> Outcome {
+        self.analyze(path, false).await
+    }
+
+    async fn analyze(&self, path: PathBuf, background: bool) -> Outcome {
+        let turn = if background {
+            match self.background.clone().acquire_owned().await {
+                Ok(p) => Some(p),
+                Err(_) => return Outcome::Failed("analyzer shut down".into()),
+            }
+        } else {
+            None
+        };
         let Ok(permit) = self.permits.clone().acquire_owned().await else {
             return Outcome::Failed("analyzer shut down".into());
         };
         let policy = self.policy.clone();
-        // The permit lives inside the blocking closure: a timed-out analysis
+        // The permits live inside the blocking closure: a timed-out analysis
         // keeps its slot until it really finishes, so stuck inputs cannot
         // pile up unbounded CPU work.
         let task = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
+            let _permits = (permit, turn);
             evaluate_file(&path, &policy)
         });
         match tokio::time::timeout(self.timeout, task).await {

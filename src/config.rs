@@ -36,6 +36,29 @@ pub struct Config {
     pub telegram: Telegram,
     pub bulk: Bulk,
     pub reclassify: Reclassify,
+    pub live: Live,
+}
+
+/// The dashboards' live summary over server-sent events (src/dashboard/live.rs).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Live {
+    /// Streams open at once, public and private together. Each holds a
+    /// connection here and one in the proxy; past this, pages poll instead.
+    pub max_streams: usize,
+    /// Streams per address (IPv4, or IPv6 /64): a few tabs.
+    pub streams_per_address: usize,
+    /// The public summary at most this often (the private one every second).
+    pub interval_ms: u64,
+    /// Table refreshes per second that all public viewers together aim for:
+    /// each refreshes at most every 10 s, less often as viewers grow.
+    pub table_refreshes_per_sec: u32,
+}
+
+impl Default for Live {
+    fn default() -> Self {
+        Self { max_streams: 4096, streams_per_address: 8, interval_ms: 2000, table_refreshes_per_sec: 20 }
+    }
 }
 
 /// Re-running zrax over the store after a zrax update (src/reclassify.rs).
@@ -86,6 +109,10 @@ pub struct Limits {
     pub min_file_bytes: u64,
     pub chunk_bytes: u64,
     pub per_ip_concurrent: u32,
+    /// Uploads at once with the import token (`fwdonor import-token`). They
+    /// share this pool instead of an address's, skip the proof of work and
+    /// the hourly limits, and may fill the spool only up to 3/4 of its cap.
+    pub import_concurrent: u32,
     pub per_ip_files_per_hour: u32,
     pub per_ip_bytes_per_hour: u64,
     pub spool_cap_bytes: u64,
@@ -151,6 +178,7 @@ impl Default for Config {
             telegram: Telegram::default(),
             bulk: Bulk::default(),
             reclassify: Reclassify::default(),
+            live: Live::default(),
         }
     }
 }
@@ -175,7 +203,8 @@ impl Default for Limits {
             max_file_bytes: 512 * 1024 * 1024,
             min_file_bytes: 24,
             chunk_bytes: 4 * 1024 * 1024,
-            per_ip_concurrent: 2,
+            per_ip_concurrent: 4,
+            import_concurrent: 32,
             per_ip_files_per_hour: 30_000,
             per_ip_bytes_per_hour: 256 * 1024 * 1024 * 1024,
             spool_cap_bytes: 16 * 1024 * 1024 * 1024,
@@ -230,6 +259,7 @@ impl Config {
         anyhow::ensure!(l.chunk_bytes >= 64 * 1024, "limits.chunk_bytes must be at least 64 KiB");
         anyhow::ensure!(l.max_file_bytes >= l.min_file_bytes, "limits.max_file_bytes < min_file_bytes");
         anyhow::ensure!(l.analysis_concurrency > 0, "limits.analysis_concurrency must be > 0");
+        anyhow::ensure!(l.per_ip_concurrent > 0 && l.import_concurrent > 0, "limits.*_concurrent must be > 0");
         anyhow::ensure!((8..=32).contains(&self.pow.bits), "pow.bits must be within 8..=32");
         anyhow::ensure!(
             (8..=36).contains(&(self.pow.bits + self.pow.download_extra_bits)),
@@ -243,6 +273,10 @@ impl Config {
         anyhow::ensure!(b.max_puts > 0 && b.max_puts_per_grant > 0, "bulk.max_puts* must be > 0");
         let r = &self.reclassify;
         anyhow::ensure!(r.threads > 0 && r.memory_mib > 0, "reclassify.threads and memory_mib must be > 0");
+        let v = &self.live;
+        anyhow::ensure!(v.streams_per_address > 0, "live.streams_per_address must be > 0");
+        anyhow::ensure!(v.interval_ms >= 250, "live.interval_ms must be at least 250");
+        anyhow::ensure!(v.table_refreshes_per_sec > 0, "live.table_refreshes_per_sec must be > 0");
         Ok(())
     }
 
@@ -252,6 +286,11 @@ impl Config {
 
     pub fn ledger_path(&self) -> PathBuf {
         self.runtime_dir.join("posted.jsonl")
+    }
+
+    /// Sidecars of background (fwdonate) jobs waiting to be posted.
+    pub fn background_dir(&self) -> PathBuf {
+        self.runtime_dir.join("background")
     }
 
     /// The files being reclassified right now (see src/reclassify.rs).
@@ -271,6 +310,12 @@ impl Config {
     /// The firmware dashboard is `/d/<this key>` (a different key).
     pub fn dashboard_key_path(&self) -> PathBuf {
         self.runtime_dir.join("dashboard.key")
+    }
+
+    /// fwdonate's import token (`--token`): more uploads at once, no proof
+    /// of work.
+    pub fn import_key_path(&self) -> PathBuf {
+        self.runtime_dir.join("import.key")
     }
 
     pub fn bulk_grants_path(&self) -> PathBuf {

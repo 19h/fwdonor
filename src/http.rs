@@ -91,14 +91,37 @@ pub(crate) fn client_ip(config: &Config, peer: SocketAddr, headers: &HeaderMap) 
     peer_ip
 }
 
+/// The import token from `Authorization: Bearer <token>`: Ok(None) without
+/// one, an error for a wrong one (so fwdonate stops at its start). Other
+/// schemes (Basic credentials a browser has cached for the site) are no
+/// token at all, so they can't lock the page out.
+fn import_token(state: &AppState, headers: &HeaderMap) -> Result<Option<ClientKey>, ApiError> {
+    let Some(value) = headers.get(header::AUTHORIZATION) else { return Ok(None) };
+    let bearer = value.as_bytes().get(..7).is_some_and(|s| s.eq_ignore_ascii_case(b"bearer "));
+    if !bearer {
+        return Ok(None);
+    }
+    let token = value.to_str().map(|v| v[7..].trim()).unwrap_or("");
+    if state.uploads.is_import_key(token) {
+        Ok(Some(ClientKey::IMPORT))
+    } else {
+        Err(ApiError::new(StatusCode::UNAUTHORIZED, "import_token", "the server doesn't accept this import token"))
+    }
+}
+
 #[derive(Deserialize)]
 struct PolicyQuery {
     /// The zrax revision the page was built with.
     rev: Option<String>,
 }
 
-async fn policy(State(state): State<AppState>, Query(q): Query<PolicyQuery>) -> impl IntoResponse {
+async fn policy(
+    State(state): State<AppState>,
+    Query(q): Query<PolicyQuery>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
     let c = &state.config;
+    let import = import_token(&state, &headers)?.is_some();
     let revs = state.uploads.revisions();
     let now = unix_now();
     // `zrax_rev` is the revision the page must have to upload. A page on a
@@ -110,7 +133,7 @@ async fn policy(State(state): State<AppState>, Query(q): Query<PolicyQuery>) -> 
         Some(_) => revs.current().to_string(),
         None => revs.oldest_accepted(now).to_string(),
     };
-    Json(json!({
+    Ok(Json(json!({
         "zrax_rev": accepted,
         "zrax_latest": revs.current(),
         "zrax": zrax_label(),
@@ -118,16 +141,26 @@ async fn policy(State(state): State<AppState>, Query(q): Query<PolicyQuery>) -> 
         "min_file_bytes": c.limits.min_file_bytes,
         "chunk_bytes": c.limits.chunk_bytes,
         "pow_bits": state.pow.bits(),
+        // Uploads at once: per address, or with the import token (which
+        // also needs no proof of work).
+        "max_parallel": if import { c.limits.import_concurrent } else { c.limits.per_ip_concurrent },
+        "import": import,
         "paused": c.is_paused(),
         "policy": c.policy,
-    }))
+    })))
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let bulk = state.bulk.activity();
+    let (background, background_bytes) = state.queue.background();
     Json(json!({
         "ok": true,
+        // Web donations waiting. fwdonate's background lane survives
+        // restarts (and the poster drains on shutdown), so it doesn't hold
+        // deploys back; the one being posted counts as `active`.
         "queued": state.queue.len(),
+        "background": background,
+        "background_bytes": background_bytes,
         "posted": state.ledger.len(),
         "spooled_bytes": state.uploads.reserved_bytes(),
         // For deploys: restart only when nothing is active and no donor has
@@ -234,6 +267,9 @@ async fn known(State(state): State<AppState>, Json(req): Json<KnownRequest>) -> 
         }
         if let Some(at) = state.ledger.posted_at(&sha) {
             known.insert(sha, json!({ "posted_at": at, "date": crate::ledger::date(at) }));
+        } else if state.queue.contains_sha(&sha) {
+            // Received and kept; waiting for its post in the background lane.
+            known.insert(sha, json!({ "in_progress": true, "queued": true }));
         } else if state.uploads.in_flight(&sha) {
             known.insert(sha, json!({ "in_progress": true }));
         }
@@ -247,7 +283,10 @@ async fn init_upload(
     headers: HeaderMap,
     Json(req): Json<InitRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let key = ClientKey::from_ip(client_ip(&state.config, peer, &headers));
+    let key = match import_token(&state, &headers)? {
+        Some(import) => import,
+        None => ClientKey::from_ip(client_ip(&state.config, peer, &headers)),
+    };
     let response = state.uploads.init(req, key)?;
     Ok((StatusCode::CREATED, Json(response)))
 }

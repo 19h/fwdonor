@@ -12,11 +12,11 @@
 //! token expires, so an interrupted download can be resumed with Range.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::net::SocketAddr;
+use std::sync::Arc;
 
-use axum::extract::{Path, Query, Request, State};
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -26,19 +26,19 @@ use tokio::sync::Semaphore;
 
 use super::catalog::{ExportKind, Query as CatalogQuery};
 use super::http::{attachment, export_kind, indexing, serve_download, sha_param, stream_export};
-use crate::analyze::zrax_label;
+use super::live::{query_key, Cached, Scope};
 use crate::config::Config;
 use crate::error::ApiError;
-use crate::http::AppState;
+use crate::http::{client_ip, AppState};
+use crate::limits::ClientKey;
 use crate::pow::PowGate;
-use crate::uploads::unix_now;
 
 /// Dimensions the public dashboard leaves out.
 const HIDDEN: [&str; 2] = ["origin", "status"];
 /// Row fields it leaves out (`stored` says whether the file can be downloaded).
 const HIDDEN_FIELDS: [&str; 3] = ["origin", "status", "reason"];
 /// Summary fields it shows.
-const SUMMARY_FIELDS: [&str; 16] = [
+pub(super) const SUMMARY_FIELDS: [&str; 16] = [
     "ready", "progress", "version", "files", "bytes", "kinds", "donors", "named_donors", "isas", "formats", "last_hour",
     "last_day", "first_at", "last_at", "zrax", "wanted",
 ];
@@ -51,14 +51,12 @@ pub const PROOFS: usize = 16;
 const PROOF_BITS: u8 = 4;
 /// Queries computed at once (they queue beyond that).
 const QUERIES: usize = 4;
-const SUMMARY_TTL: Duration = Duration::from_secs(2);
 
 pub struct Public {
     pub download_pow: PowGate,
     queries: Arc<Semaphore>,
     /// NDJSON exports read every record from disk: one at a time.
     full_exports: Arc<Semaphore>,
-    summary: Mutex<Option<(Instant, Value)>>,
 }
 
 impl Public {
@@ -70,7 +68,6 @@ impl Public {
             ),
             queries: Arc::new(Semaphore::new(QUERIES)),
             full_exports: Arc::new(Semaphore::new(1)),
-            summary: Mutex::new(None),
         }
     }
 }
@@ -133,6 +130,7 @@ pub fn page_routes() -> Router<AppState> {
 pub fn api_routes() -> Router<AppState> {
     Router::new()
         .route("/api/dashboard/summary", get(summary))
+        .route("/api/dashboard/live", get(live_stream))
         .route("/api/dashboard/query", get(query))
         .route("/api/dashboard/export", get(export))
         .route("/api/dashboard/challenge", get(challenge))
@@ -151,50 +149,59 @@ async fn page(State(state): State<AppState>) -> Response {
     axum::response::Html(html.replace(r#"<meta name="robots" content="noindex, nofollow">"#, "")).into_response()
 }
 
-async fn summary(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let p = &state.dashboard.public;
-    if let Some((at, v)) = p.summary.lock().unwrap().as_ref() {
-        if at.elapsed() < SUMMARY_TTL {
-            return Ok(Json(v.clone()));
-        }
-    }
-    let catalog = state.dashboard.catalog.clone();
-    let now = unix_now();
-    let full = tokio::task::spawn_blocking(move || catalog.summary(now, &zrax_label())).await.map_err(ApiError::internal)?;
-    let mut v = serde_json::Map::new();
-    for f in SUMMARY_FIELDS {
-        v.insert(f.into(), full[f].clone());
-    }
-    v.insert("now".into(), json!(now));
-    v.insert("public".into(), json!(true));
-    let v = Value::Object(v);
-    *p.summary.lock().unwrap() = Some((Instant::now(), v.clone()));
-    Ok(Json(v))
+/// The summary for pages that poll (the same frames the live stream sends).
+async fn summary(State(state): State<AppState>) -> Result<Response, ApiError> {
+    state.dashboard.live.summary(Scope::Public).await
 }
 
+/// The summary as server-sent events (src/dashboard/live.rs).
+async fn live_stream(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let client = ClientKey::from_ip(client_ip(&state.config, peer, &headers));
+    state.dashboard.live.stream(Scope::Public, client)
+}
+
+/// Shared between viewers asking the same: computed once per catalog change
+/// (or every few seconds while it keeps changing), served gzipped.
 async fn query(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(raw): Query<HashMap<String, String>>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let d = &state.dashboard;
     if !d.catalog.ready() {
         return Err(indexing(d));
     }
-    let q = CatalogQuery::parse(&params(raw)).map_err(ApiError::bad_request)?;
-    let _permit = d.public.queries.clone().acquire_owned().await.map_err(ApiError::internal)?;
-    let catalog = d.catalog.clone();
-    let mut v = tokio::task::spawn_blocking(move || catalog.query(&q)).await.map_err(ApiError::internal)?;
-    if let Some(rows) = v["rows"].as_array_mut() {
-        for r in rows.iter_mut() {
-            *r = row(r.take());
-        }
-    }
-    if let Some(facets) = v["facets"].as_object_mut() {
-        for dim in HIDDEN {
-            facets.remove(dim);
-        }
-    }
-    Ok(Json(v))
+    let p = params(raw);
+    let q = CatalogQuery::parse(&p).map_err(ApiError::bad_request)?;
+    let (queries, catalog) = (d.public.queries.clone(), d.catalog.clone());
+    let cached = d
+        .live
+        .public_queries
+        .get(query_key(&p), d.catalog.version(), async move {
+            let _permit = queries.acquire_owned().await.map_err(ApiError::internal)?;
+            tokio::task::spawn_blocking(move || {
+                let mut v = catalog.query(&q);
+                if let Some(rows) = v["rows"].as_array_mut() {
+                    for r in rows.iter_mut() {
+                        *r = row(r.take());
+                    }
+                }
+                if let Some(facets) = v["facets"].as_object_mut() {
+                    for dim in HIDDEN {
+                        facets.remove(dim);
+                    }
+                }
+                Cached::encode(&v)
+            })
+            .await
+            .map_err(ApiError::internal)
+        })
+        .await?;
+    Ok(cached.respond(&headers))
 }
 
 async fn export(

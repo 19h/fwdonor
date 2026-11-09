@@ -229,6 +229,104 @@ export function poll(fn, ms) {
   return run;
 }
 
+// The summary as the server pushes it (server-sent events, `${API}/live`).
+// Falls back to polling `${API}/summary` when the browser has no
+// EventSource or the server turns the stream down (no room for another,
+// too many from this address): it tries the stream again a minute or two
+// later. A tab hidden for HIDDEN_GRACE lets go of its stream and catches up
+// when it is shown again. `onFrame(summary, { streaming })`; `onError(err)`
+// for the banner.
+export function follow(onFrame, onError) {
+  const HIDDEN_GRACE = 30_000;
+  const WATCHDOG = 50_000; // the server pings every 20 s
+  const POLL = 10_000;
+  let source = null;
+  let timer = null;
+  let watchdog = null;
+  let hiddenTimer = null;
+  let running = false;
+  let pollUntil = 0;
+  let failures = 0;
+  let gen = 0;
+
+  const stop = () => {
+    gen++;
+    running = false;
+    source?.close();
+    source = null;
+    clearTimeout(timer);
+    clearTimeout(watchdog);
+  };
+  const start = () => {
+    stop();
+    if (document.hidden) return;
+    running = true;
+    if (typeof EventSource === 'undefined' || Date.now() < pollUntil) {
+      poll(gen);
+      return;
+    }
+    const my = gen;
+    const arm = () => {
+      clearTimeout(watchdog);
+      watchdog = setTimeout(() => my === gen && start(), WATCHDOG);
+    };
+    source = new EventSource(`${API}/live`);
+    arm();
+    source.addEventListener('summary', ev => {
+      if (my !== gen) return;
+      arm();
+      let s;
+      try {
+        s = JSON.parse(ev.data);
+      } catch {
+        return;
+      }
+      failures = 0;
+      onFrame(s, { streaming: true });
+    });
+    source.addEventListener('ping', () => my === gen && arm());
+    source.addEventListener('error', () => {
+      if (my !== gen) return;
+      if (source.readyState === EventSource.CLOSED) {
+        // Turned down: poll (which also shows why, e.g. a wrong key) for a while.
+        source = null;
+        clearTimeout(watchdog);
+        pollUntil = Date.now() + 60_000 + Math.random() * 60_000;
+        poll(my);
+      } else if (++failures >= 2) {
+        // The browser reconnects by itself, after the server's retry: delay.
+        onError(Object.assign(new Error('server unreachable'), { status: 0 }));
+      }
+    });
+  };
+  const poll = async my => {
+    if (my !== gen) return;
+    if (Date.now() >= pollUntil && typeof EventSource !== 'undefined') {
+      start();
+      return;
+    }
+    let wait = POLL;
+    try {
+      const s = await api('/summary');
+      if (my !== gen) return;
+      failures = 0;
+      onFrame(s, { streaming: false });
+    } catch (err) {
+      if (my !== gen) return;
+      failures++;
+      onError(err);
+      wait = Math.max(POLL, Math.min(20, err.retryAfter || 2 ** Math.min(failures - 1, 4)) * 1000);
+    }
+    timer = setTimeout(() => poll(my), wait);
+  };
+  document.addEventListener('visibilitychange', () => {
+    clearTimeout(hiddenTimer);
+    if (document.hidden) hiddenTimer = setTimeout(stop, HIDDEN_GRACE);
+    else if (!running) start();
+  });
+  start();
+}
+
 export function banner(err) {
   const el = $('banner');
   if (!el) return;

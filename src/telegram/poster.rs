@@ -5,6 +5,11 @@
 //! It also edits the captions of posts whose file was classified anew
 //! (src/reclassify.rs). Posts and edits share one pace; new donations go
 //! first, but while both are waiting every fifth turn is an edit.
+//!
+//! Web donations come before background ones (fwdonate's, src/jobs.rs),
+//! which are posted from the store's copy with the record's current
+//! classification. On shutdown the poster finishes the post it is sending
+//! and stops; a job it was only waiting on is posted after the restart.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,14 +18,14 @@ use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 use tokio::time::Instant;
 
 use super::caption;
 use super::client::{TdClient, TdError};
 use crate::analyze::Summary;
 use crate::firmwares::{Edit, Firmwares, Posted};
-use crate::jobs::{Job, PostQueue};
+use crate::jobs::{Job, Next, PostQueue, Queued};
 use crate::ledger::{Entry, Ledger};
 use crate::uploads::{unix_now, UploadState, Uploads};
 
@@ -33,6 +38,9 @@ const CHAT_RETRY: Duration = Duration::from_secs(60);
 const POSTS_PER_EDIT: u32 = 4;
 /// Tries per edit in one run (transient errors); then the next start.
 const EDIT_ATTEMPTS: u32 = 3;
+/// Failed posts of a background job (each after MAX_ATTEMPTS sends) before
+/// it is given up; it goes back to the end of its donor's turn in between.
+const BACKGROUND_ATTEMPTS: u32 = 3;
 const EDIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Errors about the chat rather than the file: retrying another file would
@@ -149,8 +157,14 @@ enum Edited {
 }
 
 enum Work {
-    Post(Job),
+    Post(Next),
     Edit(String),
+}
+
+enum PostError {
+    Failed(String),
+    /// The service is stopping: the job stays queued for the restart.
+    Stopping,
 }
 
 pub struct Poster {
@@ -161,6 +175,8 @@ pub struct Poster {
     pub ledger: Arc<Ledger>,
     pub firmwares: Arc<Firmwares>,
     pub edits: Arc<EditQueue>,
+    /// True once the service is stopping.
+    pub stop: watch::Receiver<bool>,
 }
 
 impl Poster {
@@ -168,6 +184,7 @@ impl Poster {
         let mut posts_in_a_row = 0;
         let mut edits_from = Instant::now();
         let mut attempts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut stop = self.stop.clone();
         loop {
             let edits_ready = Instant::now() >= edits_from;
             let turn = (posts_in_a_row >= POSTS_PER_EDIT && edits_ready).then(|| self.edits.pop()).flatten();
@@ -175,25 +192,38 @@ impl Poster {
                 Some(sha) => Work::Edit(sha),
                 None => tokio::select! {
                     biased;
-                    job = self.queue.next() => Work::Post(job),
+                    _ = stop.wait_for(|s| *s) => return,
+                    next = self.queue.next() => Work::Post(next),
                     sha = self.edits.next(), if edits_ready => Work::Edit(sha),
                     _ = tokio::time::sleep_until(edits_from), if !edits_ready => continue,
                 },
             };
+            if self.stopping() {
+                // Taken just now: still queued on disk, posted after the restart.
+                return;
+            }
             let started = Instant::now();
             match work {
-                Work::Post(job) => {
+                Work::Post(next) => {
+                    let (job, background) = match next {
+                        Next::Web(job) => (job, None),
+                        Next::Background(queued) => match self.ready(queued.clone()).await {
+                            Some(job) => (job, Some(queued)),
+                            None => continue,
+                        },
+                    };
                     posts_in_a_row += 1;
-                    self.post_job(job).await;
-                    tokio::time::sleep_until(started + MIN_INTERVAL).await;
+                    if !self.post_job(job, background).await || !self.pause_until(started + MIN_INTERVAL).await {
+                        return;
+                    }
                 }
                 Work::Edit(sha) => {
                     posts_in_a_row = 0;
                     match self.edit(&sha).await {
                         Edited::Done { used_telegram } => {
                             attempts.remove(&sha);
-                            if used_telegram {
-                                tokio::time::sleep_until(started + MIN_INTERVAL).await;
+                            if used_telegram && !self.pause_until(started + MIN_INTERVAL).await {
+                                return;
                             }
                         }
                         Edited::Pause(wait) => {
@@ -210,7 +240,9 @@ impl Poster {
                                 self.edits.retry_later.fetch_add(1, Ordering::Relaxed);
                                 tracing::warn!(sha256 = %sha, "editing the post keeps failing; trying again at the next start");
                             }
-                            tokio::time::sleep_until(started + MIN_INTERVAL * 2).await;
+                            if !self.pause_until(started + MIN_INTERVAL * 2).await {
+                                return;
+                            }
                         }
                     }
                 }
@@ -218,7 +250,64 @@ impl Poster {
         }
     }
 
-    async fn post_job(&mut self, job: Job) {
+    fn stopping(&self) -> bool {
+        *self.stop.borrow()
+    }
+
+    /// Wait until `at`, or less when the service stops. False: stopping.
+    async fn pause_until(&self, at: Instant) -> bool {
+        let mut stop = self.stop.clone();
+        tokio::select! {
+            biased;
+            _ = stop.wait_for(|s| *s) => false,
+            _ = tokio::time::sleep_until(at) => true,
+        }
+    }
+
+    /// A background job as a post: staged from the store under its name,
+    /// with the record's current classification. None: nothing to post (it
+    /// was posted already, or the stored copy is gone).
+    async fn ready(&self, queued: Queued) -> Option<Job> {
+        let (uploads, firmwares, ledger, q) =
+            (self.uploads.clone(), self.firmwares.clone(), self.ledger.clone(), queued.clone());
+        let staged = tokio::task::spawn_blocking(move || -> Result<Job, String> {
+            if ledger.contains(&q.sha256) {
+                return Err("it is posted already".into());
+            }
+            let record = firmwares.record(&q.sha256).map_err(|e| format!("reading its record failed: {e}"))?;
+            let summary = record.and_then(|r| r.zrax).ok_or("its record is gone")?;
+            let file = firmwares.stage(&q.sha256, &q.id, &q.name).map_err(|e| format!("staging the stored copy failed: {e}"))?;
+            let job = Job {
+                id: q.id,
+                name: q.name,
+                size: q.size,
+                sha256: q.sha256,
+                username: q.username,
+                summary,
+                file,
+                created_at: q.created_at,
+            };
+            uploads.begin_posting(&job);
+            Ok(job)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("panicked: {e}")));
+        match staged {
+            Ok(job) => {
+                self.queue.release(&job.id);
+                Some(job)
+            }
+            Err(why) => {
+                tracing::warn!(id = %queued.id, sha256 = %queued.sha256, "dropping a background job: {why}");
+                let (uploads, id) = (self.uploads.clone(), queued.id);
+                let _ = tokio::task::spawn_blocking(move || uploads.drop_background(&id)).await;
+                None
+            }
+        }
+    }
+
+    /// False: the service is stopping (the job stays queued on disk).
+    async fn post_job(&mut self, job: Job, background: Option<Queued>) -> bool {
         self.uploads.set_state(&job.id, UploadState::Posting);
         match self.post(&job).await {
             Ok(message_id) => {
@@ -248,17 +337,33 @@ impl Poster {
                     Ok(Err(e)) => tracing::error!(id = %job.id, "noting the post in the firmware record failed: {e}"),
                     Err(e) => tracing::error!(id = %job.id, "noting the post panicked: {e}"),
                 }
-                tracing::info!(id = %job.id, name = %job.name, message_id, "posted");
+                tracing::info!(id = %job.id, name = %job.name, message_id, background = background.is_some(), "posted");
                 self.uploads.finish(&job.id, UploadState::Posted);
             }
-            Err(reason) => {
-                tracing::error!(id = %job.id, name = %job.name, %reason, "posting failed, discarding");
-                self.uploads.finish(&job.id, UploadState::Failed { reason });
+            Err(PostError::Stopping) => {
+                tracing::info!(id = %job.id, "stopping before it was posted; posting it after the restart");
+                return false;
             }
+            Err(PostError::Failed(reason)) => match background.filter(|q| q.attempts + 1 < BACKGROUND_ATTEMPTS) {
+                Some(queued) => {
+                    tracing::warn!(id = %job.id, name = %job.name, %reason, "posting failed; trying again after the others");
+                    let uploads = self.uploads.clone();
+                    let requeued = tokio::task::spawn_blocking(move || uploads.requeue_background(queued)).await;
+                    if !matches!(requeued, Ok(Ok(()))) {
+                        tracing::error!(id = %job.id, "queueing it again failed, discarding");
+                        self.uploads.finish(&job.id, UploadState::Failed { reason });
+                    }
+                }
+                None => {
+                    tracing::error!(id = %job.id, name = %job.name, %reason, "posting failed, discarding");
+                    self.uploads.finish(&job.id, UploadState::Failed { reason });
+                }
+            },
         }
+        true
     }
 
-    async fn post(&mut self, job: &Job) -> Result<i64, String> {
+    async fn post(&mut self, job: &Job) -> Result<i64, PostError> {
         let caption = caption::for_job(job);
         let Some(client) = &self.client else {
             tracing::info!(id = %job.id, "dry run, would post {}:\n{}", job.file.display(), caption.text);
@@ -266,7 +371,7 @@ impl Poster {
             return Ok(0);
         };
         if !job.file.exists() {
-            return Err("spooled file vanished".into());
+            return Err(PostError::Failed("spooled file vanished".into()));
         }
         let request = |chat_id: i64| json!({
             "@type": "sendMessage",
@@ -298,22 +403,28 @@ impl Poster {
                     continue;
                 }
                 tracing::error!(id = %job.id, "cannot post to chat {} ({err}); holding the queue, retrying in {CHAT_RETRY:?}", self.chat_id);
-                tokio::time::sleep(CHAT_RETRY).await;
+                if !self.pause_until(Instant::now() + CHAT_RETRY).await {
+                    return Err(PostError::Stopping);
+                }
                 continue;
             }
             // Flood waits are Telegram pacing us, not failures.
             if let Some(wait) = err.retry_after() {
                 tracing::warn!(id = %job.id, "flood wait {wait}s");
-                tokio::time::sleep(Duration::from_secs(wait + 1)).await;
+                if !self.pause_until(Instant::now() + Duration::from_secs(wait + 1)).await {
+                    return Err(PostError::Stopping);
+                }
                 continue;
             }
             failures += 1;
             if failures >= MAX_ATTEMPTS {
-                return Err(format!("telegram: {}", err.message));
+                return Err(PostError::Failed(format!("telegram: {}", err.message)));
             }
             let backoff = Duration::from_secs(5 * 2u64.pow(failures));
             tracing::warn!(id = %job.id, failures, "send failed ({err}), retrying in {backoff:?}");
-            tokio::time::sleep(backoff).await;
+            if !self.pause_until(Instant::now() + backoff).await {
+                return Err(PostError::Stopping);
+            }
         }
     }
 
