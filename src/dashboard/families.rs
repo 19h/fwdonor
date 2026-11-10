@@ -21,7 +21,7 @@ fn of(isa: &Isa) -> (&'static str, &'static str) {
         X86 | X86_64 => ("x86", "x86"),
         Arm | AArch64 => ("arm", "ARM"),
         RiscV32 | RiscV64 | RiscV128 => ("riscv", "RISC-V"),
-        Mips | Mips64 => ("mips", "MIPS"),
+        Mips | Mips64 | Nanomips => ("mips", "MIPS"),
         Ppc | Ppc64 | PpcVle | CellSpu => ("powerpc", "PowerPC / Cell"),
         S390 | S390x => ("s390", "IBM mainframe"),
         Sparc | Sparc64 => ("sparc", "SPARC"),
