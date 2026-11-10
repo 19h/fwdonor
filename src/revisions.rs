@@ -7,6 +7,11 @@
 //! revision stays accepted for a grace period after it was replaced. The server
 //! re-verifies every file with its own zrax either way.
 //!
+//! None of this applies to a client that says it classifies with a zrax build
+//! of its own (`own_classifier` in the upload request, as the desktop
+//! workbench sends): it has no copy of ours to go stale, so it may upload
+//! whatever its revision, and the server's verdict alone decides.
+//!
 //! The history lives in `runtime/zrax-revs.json`, oldest first:
 //! `[{"rev": "<commit>", "since": <unix time it became current>}, ...]`.
 

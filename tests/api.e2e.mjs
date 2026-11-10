@@ -126,4 +126,12 @@ r = await call('POST', '/api/uploads', { name: 'x', size: 100, sha256: '00'.repe
 assert.equal(r.status, 409);
 assert.equal(r.data.error, 'stale_client');
 
+// 10. A client that classifies with its own zrax is not asked for ours: the
+// same request gets past the revision check, as far as the proof of work.
+r = await call('POST', '/api/uploads', {
+  name: 'x', size: 100, sha256: '00'.repeat(32), token: 'x', nonce: 0, zrax_rev: 'old', own_classifier: true,
+});
+assert.equal(r.status, 403);
+assert.equal(r.data.error, 'pow');
+
 console.log('api e2e ok');

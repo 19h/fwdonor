@@ -58,7 +58,8 @@ struct Session {
     last_activity: Instant,
     state: UploadState,
     summary: Option<Summary>,
-    /// The page classified this file with an older zrax than ours.
+    /// The client classified this file with another zrax than ours: an
+    /// older page, or a client with a classifier of its own.
     older_zrax: bool,
     holds_slot: bool,
     /// Bytes counted against the spool cap until the file is deleted.
@@ -83,6 +84,12 @@ pub struct InitRequest {
     pub zrax_rev: String,
     #[serde(default)]
     pub lane: Lane,
+    /// The client classifies with a zrax build of its own (the desktop
+    /// workbench) instead of the one this server ships. Its revision is
+    /// not checked: the server's own verdict decides, and a disagreement
+    /// is not held against the sender.
+    #[serde(default)]
+    pub own_classifier: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -272,7 +279,10 @@ impl Uploads {
             return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "paused", "donations are paused right now")
                 .retry_after(600));
         }
-        if !self.revisions.accepts(&req.zrax_rev, unix_now()) {
+        // A page or fwdonate runs the zrax this server shipped, so a revision
+        // we don't accept means a stale copy. A client with a zrax of its own
+        // has nothing to reload: it is admitted, and verification decides.
+        if !req.own_classifier && !self.revisions.accepts(&req.zrax_rev, unix_now()) {
             return Err(ApiError::conflict("stale_client", "the page is out of date, please reload"));
         }
         let sha = parse_sha256(&req.sha256).ok_or_else(|| ApiError::bad_request("sha256 must be 64 hex digits"))?;
@@ -347,7 +357,8 @@ impl Uploads {
                 last_activity: Instant::now(),
                 state: UploadState::Receiving,
                 summary: None,
-                older_zrax: req.zrax_rev != self.revisions.current(),
+                // Either way the client's verdict may differ from ours.
+                older_zrax: req.own_classifier || req.zrax_rev != self.revisions.current(),
                 holds_slot: true,
                 reserved: req.size,
                 lane: req.lane,
@@ -994,6 +1005,7 @@ mod tests {
             nonce: 0,
             zrax_rev: "rev".into(),
             lane: Lane::Background,
+            own_classifier: false,
         };
         let address = ClientKey::from_ip("10.0.0.9".parse().unwrap());
         assert_eq!(uploads.init(req(1, 1000), address).unwrap_err().code, "pow", "an address needs the proof of work");

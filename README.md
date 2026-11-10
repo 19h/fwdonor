@@ -66,6 +66,16 @@ The exit status is:
 
 The client has to be built from the same `ZRAX_REV` as the server. After a zrax update, the server keeps accepting the previous build for 7 days, and fwdonate prints a note asking for a rebuild. Builds from before the background lane don't ask for it: their files go to the web lane, and each run waits for its posts, until it's rebuilt.
 
+### Clients with their own zrax
+
+The desktop workbench (`zrax-desktop` in the zrax repository) is built from whatever zrax commit it was released at, not from `ZRAX_REV`. It sends `own_classifier: true` with each upload. For such an upload:
+
+- the revision is not checked, so `stale_client` never applies;
+- the server classifies the file itself, as always, and accepts or rejects it on that verdict;
+- a rejection is reported to the client but does not count towards a ban, because the two classifiers may honestly disagree.
+
+The proof of work and the per-address limits apply as for any other upload.
+
 ### Import token
 
 Importing a large collection goes faster with the server's import token, one more key next to the bulk admin and dashboard keys:
